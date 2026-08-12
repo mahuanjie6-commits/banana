@@ -1,0 +1,15 @@
+{
+  "name": "banana-image-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Banana AI image generation UI + JWMP Gemini proxy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "build": "echo \"No build step\""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

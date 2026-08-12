@@ -1,0 +1,1077 @@
+/**
+ * Banana 本地服务：静态页面 + JWMP Gemini 生图代理
+ * 启动: 配置 .env 后执行 npm start
+ */
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
+
+// ---- 读取 .env（不依赖 dotenv）----
+function loadEnv() {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) return;
+  const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const i = t.indexOf('=');
+    if (i <= 0) continue;
+    const key = t.slice(0, i).trim();
+    let val = t.slice(i + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = val;
+  }
+}
+loadEnv();
+
+const PORT = Number(process.env.PORT || 3780);
+const BASE_URL = (process.env.JWMP_BASE_URL || 'https://kwjm.com').replace(/\/$/, '');
+const RAW_KEY = process.env.JWMP_API_KEY || process.env.API_KEY || '';
+const PLACEHOLDER_KEYS = new Set(['', 'sk-xxxxxxxx', 'YOUR_API_KEY', 'your_api_key', 'changeme']);
+const API_KEY = PLACEHOLDER_KEYS.has(RAW_KEY.trim()) ? '' : RAW_KEY.trim();
+
+/**
+ * UI 模型档位 → 上游真实模型（可在「配置」页自定义，持久化到 data/models-config.json）
+ * 默认值也可通过环境变量 JWMP_MODEL_NANO / NANO2 / PRO 覆盖
+ */
+const DEFAULT_UI_MODEL = 'pro';
+const UI_MODEL_KEYS = ['nano', 'nano2', 'pro'];
+
+const DEFAULT_MODEL_CONFIG = {
+  nano: {
+    id: (process.env.JWMP_MODEL_NANO || 'gemini-2.5-flash-image').trim(),
+    label: 'Nano Banana',
+    price: '0.2元/张',
+    supportsImageSize: false, // 2.5 不支持 imageSize，仅 aspectRatio
+    maxImages: 3,
+  },
+  nano2: {
+    id: (process.env.JWMP_MODEL_NANO2 || 'gemini-3.1-flash-image-preview').trim(),
+    label: 'Nano Banana 2',
+    price: '0.4元/张',
+    supportsImageSize: true,
+    maxImages: 14,
+  },
+  pro: {
+    id: (process.env.JWMP_MODEL_PRO || 'gemini-3-pro-image-preview-hq').trim(),
+    label: 'Nano Banana Pro',
+    price: '0.8元/张',
+    supportsImageSize: true,
+    maxImages: 14,
+  },
+};
+
+// ---- 本地持久化：data/history.json + data/files/{id}/ + data/models-config.json ----
+const DATA_DIR = path.join(__dirname, 'data');
+const FILES_DIR = path.join(DATA_DIR, 'files');
+const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
+const MODEL_CONFIG_FILE = path.join(DATA_DIR, 'models-config.json');
+
+function ensureDataDirs() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(FILES_DIR)) fs.mkdirSync(FILES_DIR, { recursive: true });
+  if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, '[]', 'utf8');
+}
+
+function cloneDefaultModelConfig() {
+  const out = {};
+  for (const key of UI_MODEL_KEYS) {
+    out[key] = { ...DEFAULT_MODEL_CONFIG[key] };
+  }
+  return out;
+}
+
+/** 读取模型配置；文件缺失/损坏时回退默认值 */
+function readModelConfig() {
+  ensureDataDirs();
+  const base = cloneDefaultModelConfig();
+  try {
+    if (!fs.existsSync(MODEL_CONFIG_FILE)) return base;
+    const raw = JSON.parse(fs.readFileSync(MODEL_CONFIG_FILE, 'utf8') || '{}');
+    if (!raw || typeof raw !== 'object') return base;
+    for (const key of UI_MODEL_KEYS) {
+      const item = raw[key];
+      if (!item || typeof item !== 'object') continue;
+      const id = String(item.id || item.model || item.value || '').trim();
+      if (id) base[key].id = id;
+      // 仅允许覆盖 id；label/price/supportsImageSize 以产品档位为准
+    }
+  } catch (e) {
+    console.warn('[model-config] read failed:', e.message);
+  }
+  return base;
+}
+
+function writeModelConfig(partial) {
+  ensureDataDirs();
+  const current = readModelConfig();
+  for (const key of UI_MODEL_KEYS) {
+    const item = partial && partial[key];
+    if (!item) continue;
+    const id = String(item.id || item.model || item.value || '').trim();
+    if (!id) {
+      const err = new Error(`${current[key].label} 的模型值不能为空`);
+      err.status = 400;
+      throw err;
+    }
+    // 简单校验：允许字母数字、点、横线、下划线、中括号等常见模型名
+    if (id.length > 200) {
+      const err = new Error(`${current[key].label} 的模型值过长`);
+      err.status = 400;
+      throw err;
+    }
+    current[key].id = id;
+  }
+  // 只持久化可编辑字段
+  const toSave = {};
+  for (const key of UI_MODEL_KEYS) {
+    toSave[key] = { id: current[key].id };
+  }
+  fs.writeFileSync(MODEL_CONFIG_FILE, JSON.stringify(toSave, null, 2), 'utf8');
+  return current;
+}
+
+/** 根据当前配置构建 MODEL_MAP（含上游 id 别名） */
+function buildModelMap(cfg) {
+  const config = cfg || readModelConfig();
+  const map = {};
+  for (const key of UI_MODEL_KEYS) {
+    const meta = {
+      id: config[key].id,
+      label: config[key].label,
+      price: config[key].price,
+      supportsImageSize: config[key].supportsImageSize,
+      maxImages: config[key].maxImages,
+      uiKey: key,
+    };
+    map[key] = meta;
+    // 上游 id 也可直接匹配到该档位
+    if (meta.id) map[meta.id] = meta;
+  }
+  // 兼容旧上游名 → 当前 Pro 映射
+  const proId = config.pro.id;
+  map['gemini-3-pro-image-preview'] = map.pro;
+  map['gemini-3-pro-image-preview-hq'] = map.pro;
+  if (proId) {
+    map[proId] = map.pro;
+  }
+  map['gemini-3.1-flash-image-preview'] = map.nano2;
+  map['gemini-2.5-flash-image'] = map.nano;
+  return map;
+}
+
+function getModelMap() {
+  return buildModelMap(readModelConfig());
+}
+
+function listModelConfigForApi() {
+  const cfg = readModelConfig();
+  return UI_MODEL_KEYS.map((key, index) => ({
+    id: index + 1,
+    key,
+    label: cfg[key].label,
+    price: cfg[key].price,
+    displayName: `${cfg[key].label}（${cfg[key].price}）`,
+    value: cfg[key].id,
+    model: cfg[key].id,
+    supportsImageSize: cfg[key].supportsImageSize,
+    maxImages: cfg[key].maxImages,
+  }));
+}
+
+async function handleGetModelConfig(req, res) {
+  return sendJson(res, 200, {
+    ok: true,
+    models: listModelConfigForApi(),
+    map: Object.fromEntries(
+      UI_MODEL_KEYS.map((k) => {
+        const cfg = readModelConfig()[k];
+        return [k, { id: cfg.id, label: cfg.label, price: cfg.price, supportsImageSize: cfg.supportsImageSize }];
+      })
+    ),
+  });
+}
+
+async function handleSaveModelConfig(req, res) {
+  try {
+    let body = {};
+    try {
+      const raw = await readBody(req);
+      body = raw ? JSON.parse(raw) : {};
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: '无效的 JSON 请求体' });
+    }
+    // 支持 { models: [{key,value}] } 或 { nano:{id}, nano2:{id}, pro:{id} }
+    let partial = {};
+    if (Array.isArray(body.models)) {
+      for (const row of body.models) {
+        const key = row.key || row.uiKey;
+        if (!UI_MODEL_KEYS.includes(key)) continue;
+        partial[key] = { id: row.value || row.model || row.id };
+      }
+    } else {
+      for (const key of UI_MODEL_KEYS) {
+        if (body[key] != null) {
+          const v = body[key];
+          partial[key] = typeof v === 'string' ? { id: v } : { id: v.id || v.model || v.value };
+        }
+      }
+    }
+    if (!Object.keys(partial).length) {
+      return sendJson(res, 400, { ok: false, error: '请提供要更新的模型配置' });
+    }
+    const saved = writeModelConfig(partial);
+    console.log('[model-config] saved', Object.fromEntries(UI_MODEL_KEYS.map((k) => [k, saved[k].id])));
+    return sendJson(res, 200, {
+      ok: true,
+      models: listModelConfigForApi(),
+      map: Object.fromEntries(
+        UI_MODEL_KEYS.map((k) => [k, { id: saved[k].id, label: saved[k].label, price: saved[k].price }])
+      ),
+    });
+  } catch (e) {
+    return sendJson(res, e.status || 500, { ok: false, error: e.message || '保存失败' });
+  }
+}
+
+function readHistoryStore() {
+  ensureDataDirs();
+  try {
+    const raw = fs.readFileSync(HISTORY_FILE, 'utf8');
+    const list = JSON.parse(raw || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeHistoryStore(list) {
+  ensureDataDirs();
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(list, null, 2), 'utf8');
+}
+
+function mimeToExt(mime) {
+  const m = String(mime || '').toLowerCase();
+  if (m.includes('png')) return 'png';
+  if (m.includes('webp')) return 'webp';
+  if (m.includes('gif')) return 'gif';
+  if (m.includes('jpeg') || m.includes('jpg')) return 'jpg';
+  return 'png';
+}
+
+/** 本地时间字符串 yyyy-MM-dd HH:mm:ss（勿用 toISOString，那是 UTC 会差 8 小时） */
+function formatLocalDateTime(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/**
+ * 从 /api/files/{id}/{file} 或完整 URL 读取本地落盘图片，返回 base64
+ * 用于「重新编辑」场景：前端可能把 ref 路径当 data 提交
+ */
+function loadLocalFileAsBase64(raw) {
+  try {
+    let s = String(raw || '').trim();
+    // 去掉 query / hash
+    s = s.split('?')[0].split('#')[0];
+    // 完整 URL → 路径
+    const abs = s.match(/^https?:\/\/[^/]+(\/api\/files\/.+)$/i);
+    if (abs) s = abs[1];
+    if (s.startsWith('api/files/')) s = '/' + s;
+    const m = s.match(/^\/api\/files\/([^/]+)\/(.+)$/);
+    if (!m) return null;
+    const id = decodeURIComponent(m[1]).replace(/[^a-zA-Z0-9_-]/g, '');
+    const fileName = path.basename(decodeURIComponent(m[2]));
+    if (!id || !fileName || fileName.includes('..')) return null;
+    const full = path.join(FILES_DIR, id, fileName);
+    if (!fs.existsSync(full)) return null;
+    const buf = fs.readFileSync(full);
+    const ext = path.extname(fileName).toLowerCase();
+    let mimeType = 'image/png';
+    if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
+    else if (ext === '.webp') mimeType = 'image/webp';
+    else if (ext === '.gif') mimeType = 'image/gif';
+    else if (ext === '.png') mimeType = 'image/png';
+    return { base64: buf.toString('base64'), mimeType };
+  } catch (e) {
+    console.warn('[loadLocalFileAsBase64]', e.message);
+    return null;
+  }
+}
+
+function parseDataUrl(dataUrl) {
+  const s = String(dataUrl || '');
+  const m = s.match(/^data:([^;]+);base64,(.+)$/);
+  if (m) return { mimeType: m[1], base64: m[2] };
+  // 纯 base64
+  if (/^[A-Za-z0-9+/=\s]+$/.test(s) && s.length > 64) {
+    return { mimeType: 'image/png', base64: s.replace(/\s/g, '') };
+  }
+  return null;
+}
+
+function saveImageBuffer(recordId, fileName, buffer) {
+  const dir = path.join(FILES_DIR, String(recordId));
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const fp = path.join(dir, fileName);
+  fs.writeFileSync(fp, buffer);
+  return fileName;
+}
+
+function saveDataUrlAsFile(recordId, fileNameBase, dataUrl, mimeHint) {
+  const parsed = parseDataUrl(dataUrl);
+  if (!parsed) return null;
+  const ext = mimeToExt(parsed.mimeType || mimeHint);
+  const fileName = `${fileNameBase}.${ext}`;
+  const buf = Buffer.from(parsed.base64, 'base64');
+  return saveImageBuffer(recordId, fileName, buf);
+}
+
+function enrichHistoryItem(item) {
+  if (!item) return item;
+  const id = item.id;
+  const imageFiles = item.imageFiles || [];
+  const refFiles = item.refFiles || [];
+  const images = imageFiles.map((f, i) => ({
+    mimeType: f.endsWith('.png') ? 'image/png' : 'image/jpeg',
+    dataUrl: `/api/files/${id}/${encodeURIComponent(f)}`,
+    file: f,
+    index: i,
+  }));
+  const refImages = refFiles.map((f) => `/api/files/${id}/${encodeURIComponent(f)}`);
+  return {
+    ...item,
+    imageUrl: images[0]?.dataUrl || item.imageUrl || '',
+    images,
+    refImages,
+    bg: item.bg || (images.length ? 'bg-real' : item.bg),
+    art: images.length ? null : item.art,
+    inHistory: item.inHistory !== false,
+  };
+}
+
+function persistGenerateResult({ body, modelMeta, images, texts, upstream }) {
+  const id = Date.now();
+  const imageFiles = [];
+  images.forEach((img, i) => {
+    const name = saveDataUrlAsFile(id, String(i), img.dataUrl, img.mimeType);
+    if (name) imageFiles.push(name);
+  });
+
+  // 可选：保存参考图（限制数量，避免爆盘）
+  const refFiles = [];
+  const refs = Array.isArray(body.images) ? body.images.slice(0, 6) : [];
+  refs.forEach((img, i) => {
+    if (!img.data) return;
+    const name = saveDataUrlAsFile(id, `ref-${i}`, img.data, img.mimeType);
+    if (name) refFiles.push(name);
+  });
+
+  const record = {
+    id,
+    type: 'image',
+    prompt: String(body.prompt || '').trim() || '（参考图生成）',
+    model: body.model || DEFAULT_UI_MODEL,
+    ratio: body.aspectRatio && body.aspectRatio !== 'auto' ? body.aspectRatio : (body.ratio || '1:1'),
+    res: body.imageSize || body.res || '1K',
+    time: formatLocalDateTime(),
+    user: body.user || '马焕杰',
+    dept: body.dept || '技术部',
+    source: 'banana',
+    fav: false,
+    featured: false,
+    apiModel: modelMeta.id,
+    modelVersion: upstream?.modelVersion || modelMeta.id,
+    replyText: (texts || []).join('\n'),
+    responseId: upstream?.responseId || '',
+    usageMetadata: upstream?.usageMetadata || null,
+    imageFiles,
+    refFiles,
+    inHistory: true,
+    persisted: true,
+  };
+
+  const list = readHistoryStore();
+  list.unshift(record);
+  // 最多保留 500 条元数据（文件仍可能残留，可后续清理）
+  if (list.length > 500) list.length = 500;
+  writeHistoryStore(list);
+  return enrichHistoryItem(record);
+}
+
+function persistFailRecord({ body, error }) {
+  const id = Date.now();
+  // 失败时也保存参考图，便于「重新编辑 / 再次生成」回填
+  const refFiles = [];
+  const refs = Array.isArray(body?.images) ? body.images.slice(0, 6) : [];
+  refs.forEach((img, i) => {
+    if (!img?.data) return;
+    const name = saveDataUrlAsFile(id, `ref-${i}`, img.data, img.mimeType);
+    if (name) refFiles.push(name);
+  });
+
+  const record = {
+    id,
+    type: 'fail',
+    prompt: String(body?.prompt || '').trim(),
+    model: body?.model || DEFAULT_UI_MODEL,
+    ratio: body?.aspectRatio || body?.ratio || '',
+    res: body?.imageSize || body?.res || '',
+    time: formatLocalDateTime(),
+    user: body?.user || '马焕杰',
+    dept: body?.dept || '技术部',
+    source: 'banana',
+    error: String(error || '生成失败'),
+    imageFiles: [],
+    refFiles,
+    inHistory: true,
+    persisted: true,
+  };
+  const list = readHistoryStore();
+  list.unshift(record);
+  if (list.length > 500) list.length = 500;
+  writeHistoryStore(list);
+  // enrich 后带 refImages 路径，前端可直接回填
+  return enrichHistoryItem(record);
+}
+
+function updateHistoryRecord(id, patch) {
+  const list = readHistoryStore();
+  const idx = list.findIndex((x) => String(x.id) === String(id));
+  if (idx < 0) return null;
+  const allowed = ['fav', 'featured', 'prompt'];
+  const next = { ...list[idx] };
+  for (const k of allowed) {
+    if (k in patch) next[k] = patch[k];
+  }
+  list[idx] = next;
+  writeHistoryStore(list);
+  return enrichHistoryItem(next);
+}
+
+function deleteHistoryRecord(id) {
+  const list = readHistoryStore();
+  const idx = list.findIndex((x) => String(x.id) === String(id));
+  if (idx < 0) return false;
+  list.splice(idx, 1);
+  writeHistoryStore(list);
+  // 删除图片目录
+  const dir = path.join(FILES_DIR, String(id));
+  try {
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  } catch (e) {
+    console.warn('delete files failed', e.message);
+  }
+  return true;
+}
+
+function resolveModel(input) {
+  const key = String(input || DEFAULT_UI_MODEL).trim();
+  const MODEL_MAP = getModelMap();
+  const meta = MODEL_MAP[key] || MODEL_MAP[DEFAULT_UI_MODEL];
+  const uiKey = meta.uiKey || (UI_MODEL_KEYS.includes(key) ? key : DEFAULT_UI_MODEL);
+  const id = meta.id;
+  // 始终返回独立副本；supportsImageSize 按实际上游模型 id 判定
+  return {
+    id,
+    label: meta.label,
+    price: meta.price,
+    supportsImageSize: resolveSupportsImageSize(uiKey, id),
+    maxImages: meta.maxImages,
+    uiKey,
+  };
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+};
+
+const ALLOWED_RATIOS = new Set([
+  '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9',
+]);
+/** Gemini 官方 imageConfig.imageSize：大写 K；3.1 另支持 512，本产品 UI 仅暴露 1K/2K/4K */
+const ALLOWED_SIZES = new Set(['1K', '2K', '4K', '512']);
+
+/**
+ * 规范化分辨率传参
+ * - 去空格、统一大写 K（2k → 2K）
+ * - 非法值回退 1K
+ */
+function normalizeImageSize(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return '1K';
+  // 兼容 2k / 2K / 2 k / 2048 等
+  s = s.replace(/\s+/g, '');
+  const lower = s.toLowerCase();
+  if (lower === '1k' || lower === '1024') return '1K';
+  if (lower === '2k' || lower === '2048') return '2K';
+  if (lower === '4k' || lower === '4096') return '4K';
+  if (lower === '512' || lower === '0.5k' || lower === '512px') return '512';
+  // 已是标准写法
+  if (ALLOWED_SIZES.has(s)) return s;
+  // 1k 这种混写
+  const m = s.match(/^([124])k$/i);
+  if (m) return `${m[1]}K`;
+  return '1K';
+}
+
+/**
+ * 是否应向上游传 imageConfig.imageSize
+ * 以实际上游 model id 为准，避免配置页换模型后仍用档位默认
+ *
+ * - gemini-2.5-flash-image*：不支持 imageSize（仅 aspectRatio）
+ * - gemini-3.1-flash-image* / gemini-3-pro-image*：支持 1K/2K/4K
+ */
+function resolveSupportsImageSize(uiKey, modelId) {
+  const id = String(modelId || '').toLowerCase();
+  if (!id) return Boolean(DEFAULT_MODEL_CONFIG[uiKey]?.supportsImageSize);
+
+  // 2.5 图像模型：不支持 imageSize
+  if (id.includes('2.5') && id.includes('image')) return false;
+  if (id.includes('gemini-2.5')) return false;
+
+  // 3.1 Flash Image / 3 Pro Image 系列：支持
+  if (
+    id.includes('3.1-flash-image') ||
+    id.includes('flash-image-preview') ||
+    id.includes('pro-image-preview') ||
+    id.includes('pro-image') ||
+    (id.includes('flash-image') && !id.includes('2.5'))
+  ) {
+    return true;
+  }
+
+  // 回退：按 UI 档位
+  return Boolean(DEFAULT_MODEL_CONFIG[uiKey]?.supportsImageSize);
+}
+
+function sendJson(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+  });
+  res.end(body);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    const max = 40 * 1024 * 1024; // 40MB（多图 base64）
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > max) {
+        reject(new Error('请求体过大'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function proxyGenerate(modelId, payload) {
+  return new Promise((resolve, reject) => {
+    const apiPath = `/v1beta/models/${encodeURIComponent(modelId)}:generateContent`;
+    const url = new URL(BASE_URL + apiPath);
+    console.log(`[generate] → ${url.href}`);
+    const data = JSON.stringify(payload);
+    const lib = url.protocol === 'https:' ? https : http;
+    const req = lib.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(data),
+          Accept: 'application/json',
+        },
+        timeout: 360000,
+      },
+      (resp) => {
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          let json = null;
+          try {
+            json = raw ? JSON.parse(raw) : null;
+          } catch {
+            json = { raw };
+          }
+          resolve({ status: resp.statusCode || 500, data: json, raw, modelId, apiPath });
+        });
+      }
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('上游请求超时（360s）'));
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+function buildPayload(body, modelMeta) {
+  const prompt = String(body.prompt || '').trim();
+  if (!prompt && !(body.images && body.images.length)) {
+    const err = new Error('请输入提示词或上传参考图');
+    err.status = 400;
+    throw err;
+  }
+
+  const parts = [];
+  const maxImages = modelMeta.maxImages || 14;
+
+  // 参考图：优先 inlineData（前端 base64）；兼容 /api/files/... 本地路径
+  const images = Array.isArray(body.images) ? body.images : [];
+  for (const img of images.slice(0, maxImages)) {
+    if (img.data) {
+      let data = String(img.data).trim();
+      let mimeType = img.mimeType || 'image/png';
+
+      // dataURL
+      const m = data.match(/^data:([^;]+);base64,(.+)$/);
+      if (m) {
+        mimeType = m[1] || mimeType;
+        data = m[2];
+      } else if (
+        data.startsWith('/api/files/') ||
+        data.startsWith('api/files/') ||
+        /^https?:\/\/[^/]+\/api\/files\//i.test(data)
+      ) {
+        // 重新编辑场景：前端可能直接传本地文件 URL
+        const resolved = loadLocalFileAsBase64(data);
+        if (!resolved) {
+          const err = new Error('参考图文件不存在或无法读取，请重新上传');
+          err.status = 400;
+          throw err;
+        }
+        mimeType = resolved.mimeType || mimeType;
+        data = resolved.base64;
+      } else if (data.includes('/') || data.includes('\\') || data.startsWith('http')) {
+        // 非 base64 的路径/URL，拒绝以免上游报 Base64 decoding failed
+        const err = new Error('参考图格式无效（需要 base64 或本地 /api/files 路径）');
+        err.status = 400;
+        throw err;
+      }
+      // 粗校验：纯 base64 才继续
+      if (!/^[A-Za-z0-9+/=\s]+$/.test(data) || data.length < 32) {
+        const err = new Error('参考图 Base64 无效，请重新上传图片后再试');
+        err.status = 400;
+        throw err;
+      }
+      parts.push({
+        inlineData: {
+          mimeType,
+          data: data.replace(/\s/g, ''),
+        },
+      });
+    } else if (img.fileUri) {
+      parts.push({
+        fileData: {
+          mimeType: img.mimeType || 'image/png',
+          fileUri: img.fileUri,
+        },
+      });
+    }
+  }
+
+  if (prompt) {
+    parts.push({ text: prompt });
+  } else {
+    parts.push({ text: '根据参考图生成高质量图片' });
+  }
+
+  const imageConfig = {};
+  let ratio = body.aspectRatio || body.ratio;
+  if (ratio && ratio !== 'auto' && ALLOWED_RATIOS.has(ratio)) {
+    imageConfig.aspectRatio = ratio;
+  }
+
+  // imageSize：官方 REST 字段 generationConfig.imageConfig.imageSize
+  // 取值必须为 "1K" | "2K" | "4K"（3.1 另支持 "512"）；大小写敏感，K 为大写
+  const supportsSize = modelMeta.supportsImageSize !== false
+    ? resolveSupportsImageSize(modelMeta.uiKey, modelMeta.id)
+    : false;
+  let normalizedSize = null;
+  if (supportsSize) {
+    normalizedSize = normalizeImageSize(body.imageSize || body.res || '1K');
+    // 产品 UI 不暴露 512 时，仍允许显式传入；默认回退 1K
+    if (!ALLOWED_SIZES.has(normalizedSize)) normalizedSize = '1K';
+    imageConfig.imageSize = normalizedSize;
+  }
+
+  const generationConfig = {
+    responseModalities: ['TEXT', 'IMAGE'],
+  };
+  if (Object.keys(imageConfig).length) {
+    generationConfig.imageConfig = imageConfig;
+  }
+  if (typeof body.temperature === 'number') {
+    generationConfig.temperature = Math.min(1, Math.max(0, body.temperature));
+  }
+
+  const payload = {
+    contents: [
+      {
+        role: 'user',
+        parts,
+      },
+    ],
+    generationConfig,
+  };
+
+  // 便于核对各模型传参
+  console.log(
+    `[payload] model=${modelMeta.id} ui=${modelMeta.uiKey || '-'} ` +
+      `supportsImageSize=${supportsSize} ` +
+      `imageConfig=${JSON.stringify(imageConfig)} ` +
+      `refs=${parts.filter((p) => p.inlineData).length}`
+  );
+
+  return payload;
+}
+
+function extractImages(apiResp) {
+  const images = [];
+  const texts = [];
+  const candidates = apiResp?.candidates || [];
+  for (const c of candidates) {
+    const parts = c?.content?.parts || [];
+    for (const p of parts) {
+      if (p.inlineData?.data) {
+        const mime = p.inlineData.mimeType || 'image/jpeg';
+        images.push({
+          mimeType: mime,
+          dataUrl: `data:${mime};base64,${p.inlineData.data}`,
+          // 前端展示用 dataUrl 即可；不回传超大纯 base64 字段重复
+        });
+      }
+      if (p.text) texts.push(p.text);
+    }
+  }
+  return { images, texts };
+}
+
+async function handleGenerate(req, res) {
+  if (!API_KEY) {
+    return sendJson(res, 500, {
+      ok: false,
+      error: '未配置 JWMP_API_KEY，请在项目目录创建 .env 并填入密钥',
+    });
+  }
+
+  let body;
+  try {
+    const raw = await readBody(req);
+    body = raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return sendJson(res, 400, { ok: false, error: '请求 JSON 无效: ' + e.message });
+  }
+
+  const modelMeta = resolveModel(body.model || body.uiModel || DEFAULT_UI_MODEL);
+  const reqSize = normalizeImageSize(body.imageSize || body.res || '1K');
+  console.log(
+    `[generate] uiModel=${body.model || DEFAULT_UI_MODEL} → upstream=${modelMeta.id} ` +
+      `req.imageSize=${body.imageSize || body.res || ''} → ${reqSize} ` +
+      `supportsImageSize=${modelMeta.supportsImageSize}`
+  );
+
+  let payload;
+  try {
+    payload = buildPayload(body, modelMeta);
+  } catch (e) {
+    return sendJson(res, e.status || 400, { ok: false, error: e.message });
+  }
+
+  try {
+    const upstream = await proxyGenerate(modelMeta.id, payload);
+    if (upstream.status < 200 || upstream.status >= 300) {
+      const msg =
+        upstream.data?.error?.message ||
+        upstream.data?.message ||
+        upstream.data?.error ||
+        (typeof upstream.data === 'string' ? upstream.data : null) ||
+        upstream.raw?.slice(0, 300) ||
+        `上游错误 HTTP ${upstream.status}`;
+      console.error(`[generate] fail model=${modelMeta.id} status=${upstream.status} msg=${msg}`);
+      // 统一落盘并回传 record，避免前端再调 /api/history/fail 造成双份记录
+      let fail = null;
+      try {
+        fail = persistFailRecord({ body, error: String(msg) });
+      } catch (_) { /* ignore */ }
+      return sendJson(res, upstream.status === 401 || upstream.status === 403 ? upstream.status : 502, {
+        ok: false,
+        error: String(msg),
+        status: upstream.status,
+        model: modelMeta.id,
+        requestedPath: `/v1beta/models/${modelMeta.id}:generateContent`,
+        uiModel: modelMeta.label,
+        detail: upstream.data,
+        record: fail,
+      });
+    }
+
+    const { images, texts } = extractImages(upstream.data);
+    if (!images.length) {
+      // 可能被安全策略拦了，或只返回了文本
+      const finish = upstream.data?.candidates?.[0]?.finishReason;
+      const errMsg = texts.join('\n') || `未返回图片${finish ? '（finishReason: ' + finish + '）' : ''}`;
+      const fail = persistFailRecord({ body, error: errMsg });
+      return sendJson(res, 502, {
+        ok: false,
+        error: errMsg,
+        model: modelMeta.id,
+        record: fail,
+        detail: {
+          finishReason: finish,
+          texts,
+          usageMetadata: upstream.data?.usageMetadata,
+        },
+      });
+    }
+
+    // 写入本地磁盘，刷新后可恢复
+    const record = persistGenerateResult({
+      body,
+      modelMeta,
+      images,
+      texts,
+      upstream: {
+        modelVersion: upstream.data?.modelVersion || modelMeta.id,
+        responseId: upstream.data?.responseId,
+        usageMetadata: upstream.data?.usageMetadata,
+      },
+    });
+    console.log(`[persist] saved id=${record.id} files=${(record.imageFiles || []).join(',')}`);
+
+    return sendJson(res, 200, {
+      ok: true,
+      images: record.images,
+      texts,
+      record,
+      model: modelMeta.id,
+      uiModel: body.model || DEFAULT_UI_MODEL,
+      uiLabel: modelMeta.label,
+      modelVersion: upstream.data?.modelVersion || modelMeta.id,
+      responseId: upstream.data?.responseId,
+      usageMetadata: upstream.data?.usageMetadata,
+    });
+  } catch (e) {
+    const errMsg = '请求上游失败: ' + e.message;
+    let fail = null;
+    try {
+      fail = persistFailRecord({ body, error: errMsg });
+    } catch (_) { /* ignore */ }
+    // 必须带回 record，前端才能只插一条，不再二次 POST /api/history/fail
+    return sendJson(res, 502, { ok: false, error: errMsg, record: fail });
+  }
+}
+
+function handleHistoryList(req, res) {
+  const list = readHistoryStore().map(enrichHistoryItem);
+  return sendJson(res, 200, { ok: true, items: list, total: list.length });
+}
+
+async function handleHistoryPatch(req, res, id) {
+  let body;
+  try {
+    const raw = await readBody(req);
+    body = raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return sendJson(res, 400, { ok: false, error: '请求 JSON 无效' });
+  }
+  const updated = updateHistoryRecord(id, body);
+  if (!updated) return sendJson(res, 404, { ok: false, error: '记录不存在' });
+  return sendJson(res, 200, { ok: true, record: updated });
+}
+
+function handleHistoryDelete(req, res, id) {
+  const ok = deleteHistoryRecord(id);
+  if (!ok) return sendJson(res, 404, { ok: false, error: '记录不存在' });
+  return sendJson(res, 200, { ok: true });
+}
+
+async function handleHistoryCreateFail(req, res) {
+  let body;
+  try {
+    const raw = await readBody(req);
+    body = raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return sendJson(res, 400, { ok: false, error: '请求 JSON 无效' });
+  }
+  const record = persistFailRecord({ body, error: body.error || '生成失败' });
+  return sendJson(res, 200, { ok: true, record });
+}
+
+function serveHistoryFile(req, res, id, fileName) {
+  // 防路径穿越
+  const safeId = String(id).replace(/[^a-zA-Z0-9_-]/g, '');
+  const safeName = path.basename(fileName);
+  const dir = path.resolve(FILES_DIR, safeId);
+  const fp = path.resolve(dir, safeName);
+  if (!fp.startsWith(dir + path.sep) && fp !== dir) {
+    res.writeHead(403);
+    return res.end('Forbidden');
+  }
+  if (!fs.existsSync(fp) || fs.statSync(fp).isDirectory()) {
+    res.writeHead(404);
+    return res.end('Not Found');
+  }
+  const ext = path.extname(fp).toLowerCase();
+  res.writeHead(200, {
+    'Content-Type': MIME[ext] || 'application/octet-stream',
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'Access-Control-Allow-Origin': '*',
+  });
+  fs.createReadStream(fp).pipe(res);
+}
+
+function serveStatic(req, res, urlPath) {
+  let rel = decodeURIComponent(urlPath.split('?')[0]);
+  if (rel === '/') rel = '/index.html';
+  // 安全：禁止路径穿越
+  const safe = path.normalize(rel).replace(/^(\.\.[/\\])+/, '');
+  const filePath = path.join(__dirname, safe);
+  if (!filePath.startsWith(__dirname)) {
+    res.writeHead(403);
+    return res.end('Forbidden');
+  }
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    res.writeHead(404);
+    return res.end('Not Found');
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  res.writeHead(200, {
+    'Content-Type': MIME[ext] || 'application/octet-stream',
+    'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600',
+  });
+  fs.createReadStream(filePath).pipe(res);
+}
+
+const server = http.createServer(async (req, res) => {
+  const method = req.method || 'GET';
+  const urlPath = req.url || '/';
+
+  if (method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+    });
+    return res.end();
+  }
+
+  if (method === 'GET' && (urlPath === '/api/health' || urlPath.startsWith('/api/health?'))) {
+    const cfg = readModelConfig();
+    return sendJson(res, 200, {
+      ok: true,
+      baseUrl: BASE_URL,
+      defaultModel: resolveModel(DEFAULT_UI_MODEL).id,
+      models: Object.fromEntries(
+        UI_MODEL_KEYS.map((k) => [k, { id: cfg[k].id, label: cfg[k].label }])
+      ),
+      hasKey: Boolean(API_KEY),
+      keyHint: API_KEY ? `${API_KEY.slice(0, 6)}…${API_KEY.slice(-4)}` : null,
+    });
+  }
+
+  // 模型配置：读取 / 保存（配置页）
+  if (urlPath === '/api/model-config' || urlPath.startsWith('/api/model-config?')) {
+    if (method === 'GET') return handleGetModelConfig(req, res);
+    if (method === 'PUT' || method === 'POST') return handleSaveModelConfig(req, res);
+  }
+
+  if (method === 'POST' && (urlPath === '/api/generate' || urlPath.startsWith('/api/generate?'))) {
+    return handleGenerate(req, res);
+  }
+
+  // 历史列表
+  if (method === 'GET' && (urlPath === '/api/history' || urlPath.startsWith('/api/history?'))) {
+    return handleHistoryList(req, res);
+  }
+
+  // 保存失败记录（可选，生成失败时前端也可调）
+  if (method === 'POST' && (urlPath === '/api/history/fail' || urlPath.startsWith('/api/history/fail?'))) {
+    return handleHistoryCreateFail(req, res);
+  }
+
+  // PATCH /api/history/:id  DELETE /api/history/:id
+  const histMatch = urlPath.match(/^\/api\/history\/([^/?#]+)/);
+  if (histMatch) {
+    const id = decodeURIComponent(histMatch[1]);
+    if (method === 'PATCH' || method === 'POST') return handleHistoryPatch(req, res, id);
+    if (method === 'DELETE') return handleHistoryDelete(req, res, id);
+  }
+
+  // GET /api/files/:id/:file
+  const fileMatch = urlPath.match(/^\/api\/files\/([^/]+)\/([^/?#]+)/);
+  if (method === 'GET' && fileMatch) {
+    return serveHistoryFile(req, res, decodeURIComponent(fileMatch[1]), decodeURIComponent(fileMatch[2]));
+  }
+
+  if (method === 'GET') {
+    return serveStatic(req, res, urlPath);
+  }
+
+  sendJson(res, 404, { ok: false, error: 'Not Found' });
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\n  端口 ${PORT} 已被占用。请先关闭占用进程，或修改 .env 中的 PORT。\n`);
+  } else {
+    console.error('\n  服务启动失败:', err.message, '\n');
+  }
+  process.exit(1);
+});
+
+// 明确绑定所有网卡，避免只监听某些地址导致浏览器连不上
+server.listen(PORT, '0.0.0.0', () => {
+  console.log('');
+  console.log('  ========================================');
+  console.log('  Banana 服务已启动（请保持本窗口开启）');
+  console.log('  ========================================');
+  console.log(`  页面:     http://127.0.0.1:${PORT}/`);
+  console.log(`  备选:     http://localhost:${PORT}/`);
+  console.log(`  健康检查: http://127.0.0.1:${PORT}/api/health`);
+  console.log(`  网关:     ${BASE_URL}`);
+  const bootCfg = readModelConfig();
+  console.log(`  默认:     Nano Banana Pro → ${bootCfg.pro.id}`);
+  console.log(`  映射:     nano → ${bootCfg.nano.id}`);
+  console.log(`           nano2 → ${bootCfg.nano2.id}`);
+  console.log(`           pro → ${bootCfg.pro.id}`);
+  console.log(`  API Key:  ${API_KEY ? '已配置' : '未配置（请创建 .env 填入 JWMP_API_KEY）'}`);
+  ensureDataDirs();
+  const n = readHistoryStore().length;
+  console.log(`  本地记录: ${n} 条 → ${HISTORY_FILE}`);
+  console.log(`  模型配置: ${MODEL_CONFIG_FILE}`);
+  console.log('  ----------------------------------------');
+  console.log('  关闭本窗口 = 停止服务，页面将无法访问');
+  console.log('  ========================================');
+  console.log('');
+});

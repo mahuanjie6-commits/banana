@@ -1,0 +1,9 @@
+.env
+node_modules/
+*.log
+.DS_Store
+data/
+test-*.json
+up-*.json
+# 本地若写了真实后端地址，勿提交（可用 config.example.js）
+# config.js 可提交空模板；若含生产 API 地址可按需忽略

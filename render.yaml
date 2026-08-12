@@ -1,0 +1,21 @@
+# Render Blueprint — 在 Dashboard 选择 New > Blueprint 连接本仓库
+# 文档: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: banana
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: "npm run build"
+    startCommand: "node server.js"
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "20.18.0"
+      - key: JWMP_BASE_URL
+        value: https://kwjm.com
+      # 密钥在 Render 控制台手动填写（创建服务时会提示）
+      - key: JWMP_API_KEY
+        sync: false
+      - key: JWMP_MODEL_PRO
+        value: gemini-3-pro-image-preview-hq
