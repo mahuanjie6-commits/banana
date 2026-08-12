@@ -777,6 +777,26 @@ function extractImages(apiResp) {
   return { images, texts };
 }
 
+/** 进行中的生成请求指纹，防止前端双发导致上游被调两次、落盘两条 */
+const inflightGenerates = new Set();
+
+function generateFingerprint(body) {
+  const prompt = String(body?.prompt || '').trim();
+  const model = String(body?.model || body?.uiModel || '');
+  const ratio = String(body?.aspectRatio || body?.ratio || '');
+  const size = String(body?.imageSize || body?.res || '');
+  const imgs = Array.isArray(body?.images) ? body.images : [];
+  // 用参考图数量 + 每张 data 长度做轻量指纹（避免整段 base64 进 Set）
+  const refSig = imgs
+    .slice(0, 6)
+    .map((img) => {
+      const d = String(img?.data || img?.fileUri || '');
+      return `${d.length}:${d.slice(0, 24)}`;
+    })
+    .join('|');
+  return `${model}|${ratio}|${size}|${prompt}|${imgs.length}|${refSig}`;
+}
+
 async function handleGenerate(req, res) {
   if (!API_KEY) {
     return sendJson(res, 500, {
@@ -793,6 +813,17 @@ async function handleGenerate(req, res) {
     return sendJson(res, 400, { ok: false, error: '请求 JSON 无效: ' + e.message });
   }
 
+  const fp = generateFingerprint(body);
+  if (inflightGenerates.has(fp)) {
+    console.warn(`[generate] reject duplicate in-flight request fp=${fp.slice(0, 80)}…`);
+    return sendJson(res, 429, {
+      ok: false,
+      error: '相同请求正在生成中，请勿重复提交',
+      duplicate: true,
+    });
+  }
+  inflightGenerates.add(fp);
+
   const modelMeta = resolveModel(body.model || body.uiModel || DEFAULT_UI_MODEL);
   const reqSize = normalizeImageSize(body.imageSize || body.res || '1K');
   console.log(
@@ -805,6 +836,7 @@ async function handleGenerate(req, res) {
   try {
     payload = buildPayload(body, modelMeta);
   } catch (e) {
+    inflightGenerates.delete(fp);
     return sendJson(res, e.status || 400, { ok: false, error: e.message });
   }
 
@@ -889,6 +921,8 @@ async function handleGenerate(req, res) {
     } catch (_) { /* ignore */ }
     // 必须带回 record，前端才能只插一条，不再二次 POST /api/history/fail
     return sendJson(res, 502, { ok: false, error: errMsg, record: fail });
+  } finally {
+    inflightGenerates.delete(fp);
   }
 }
 

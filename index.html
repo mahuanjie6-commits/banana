@@ -2571,7 +2571,7 @@
                     </div>
                   </div>
                 </div>
-                <button class="send-btn" id="sendBtn" title="生成" disabled>
+                <button type="button" class="send-btn" id="sendBtn" title="生成" disabled>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
                 </button>
               </div>
@@ -3895,6 +3895,12 @@
     }
 
     function updateSendState() {
+      // 生成中禁止再次点发送，避免 updateSendState 把按钮重新点亮导致双发
+      if (state.generating) {
+        $('#sendBtn').disabled = true;
+        $('#sendBtn').classList.remove('enabled');
+        return;
+      }
       const has = $('#promptInput').value.trim().length > 0 || state.attachments.length > 0;
       $('#sendBtn').disabled = !has;
       $('#sendBtn').classList.toggle('enabled', has);
@@ -4319,12 +4325,21 @@
       return ok.has(ratio) ? ratio : '1:1';
     }
 
+    /** 同步闸门：必须在任何 await 之前占用，防止 Enter/连点/双监听同一时刻双发 */
+    let generateGate = false;
+
     async function doGenerate(prompt) {
+      // 最先检查闸门（同步），避免两个事件处理器在同一轮里都通过
+      if (generateGate || state.generating) {
+        console.warn('[Banana] ignore duplicate generate (already in flight)');
+        return;
+      }
+
       const text = (prompt ?? $('#promptInput').value).trim();
       if (!text && !state.attachments.length) return;
-      if (state.generating) return;
 
       const finalPrompt = text || '根据参考图生成高质量图片';
+      generateGate = true;
       state.generating = true;
       $('#emptyState')?.classList.remove('show');
       $('#generating').classList.add('show');
@@ -4332,8 +4347,7 @@
       // 生成中贴底（无动画）
       pinFeedToBottom();
       closePopups();
-      $('#sendBtn').disabled = true;
-      $('#sendBtn').classList.remove('enabled');
+      updateSendState();
 
       try {
         // 支持：本地 File、dataURL、以及重新编辑回填的 /api/files 路径
@@ -4351,6 +4365,11 @@
 
         let resp;
         try {
+          console.info('[Banana] POST /api/generate', {
+            model: payload.model,
+            promptLen: finalPrompt.length,
+            refs: images.length,
+          });
           resp = await fetch(apiUrl('/api/generate'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -4364,6 +4383,11 @@
         const data = await resp.json().catch(() => ({}));
 
         if (!resp.ok || !data.ok) {
+          // 服务端拦截的重复提交：不落失败记录、不当作生成失败打扰用户
+          if (resp.status === 429 || data.duplicate) {
+            showToast(data.error || '相同请求正在生成中');
+            return;
+          }
           const errMsg = data.error || `生成失败 (${resp.status})`;
           // 本次上传的参考图（用于失败记录展示与重新编辑回填）
           const localRefUrls = images.map(img => img.data).filter(Boolean);
@@ -4488,6 +4512,7 @@
         }
       } finally {
         state.generating = false;
+        generateGate = false;
         $('#generating').classList.remove('show');
         $('#generating span').textContent = '正在生成中…';
         updateSendState();
@@ -4623,13 +4648,19 @@
       updateSendState();
     });
     promptInput.addEventListener('keydown', e => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        doGenerate();
-      }
+      // 中文输入法选词时的 Enter 不应触发生成；长按重复 keydown 忽略
+      if (e.key !== 'Enter' || e.shiftKey) return;
+      if (e.isComposing || e.keyCode === 229 || e.repeat) return;
+      e.preventDefault();
+      e.stopPropagation();
+      doGenerate();
     });
 
-    $('#sendBtn').addEventListener('click', () => doGenerate());
+    $('#sendBtn').addEventListener('click', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      doGenerate();
+    });
 
     function reeditItem(item) {
       if (!item) return;
@@ -4724,12 +4755,18 @@
 
       const btn = e.target.closest('[data-action]');
       if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
       const id = btn.dataset.id ? Number(btn.dataset.id) : state.currentId;
       const item = HISTORY.find(h => h.id === id) || HISTORY.find(h => h.id === state.currentId);
       if (btn.dataset.action === 'reedit' && item) {
         state.currentId = item.id;
         reeditItem(item);
       } else if (btn.dataset.action === 'regen' && item) {
+        if (generateGate || state.generating) {
+          showToast('正在生成中，请稍候…');
+          return;
+        }
         state.currentId = item.id;
         closeDetail();
         // 再次生成前先回填参考图/模型，再直接发起
@@ -4768,11 +4805,20 @@
       switchPage('banana');
       reeditItem(item);
     });
-    $('#detailRegen').addEventListener('click', () => {
+    $('#detailRegen').addEventListener('click', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (generateGate || state.generating) {
+        showToast('正在生成中，请稍候…');
+        return;
+      }
       const item = HISTORY.find(h => h.id === state.detailId);
       closeDetail();
       switchPage('banana');
-      if (item) doGenerate(item.prompt);
+      if (!item) return;
+      // 与列表「再次生成」一致：先回填参考图/参数再发一次
+      reeditItem(item);
+      doGenerate(item.prompt);
     });
     $('#detailAsRef').addEventListener('click', () => {
       const item = HISTORY.find(h => h.id === state.detailId);
