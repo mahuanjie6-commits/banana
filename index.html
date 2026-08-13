@@ -4383,9 +4383,36 @@
         const data = await resp.json().catch(() => ({}));
 
         if (!resp.ok || !data.ok) {
-          // 服务端拦截的重复提交：不落失败记录、不当作生成失败打扰用户
+          // 服务端拦截的重复提交：说明上一次还在跑，轮询历史看是否已出图，避免误报失败
           if (resp.status === 429 || data.duplicate) {
-            showToast(data.error || '相同请求正在生成中');
+            const waitHint = data.elapsedSec
+              ? `相同内容正在生成中（已 ${data.elapsedSec} 秒），请稍候…`
+              : (data.error || '相同请求正在生成中，请稍候…');
+            showToast(waitHint);
+            $('#generating span').textContent = waitHint;
+            const beforeIds = new Set(HISTORY.map(h => h.id));
+            const deadline = Date.now() + Math.min(120000, Math.max(15000, (data.retryAfterSec || 30) * 1000));
+            while (Date.now() < deadline) {
+              await new Promise(r => setTimeout(r, 3000));
+              try {
+                await loadPersistedHistory();
+                const found = HISTORY.find(h =>
+                  h.type !== 'fail' &&
+                  !beforeIds.has(h.id) &&
+                  String(h.prompt || '').trim() === finalPrompt
+                );
+                if (found) {
+                  state.currentId = found.id;
+                  HISTORY.forEach(h => { h.active = h.id === found.id; });
+                  renderHistory();
+                  renderFeed({ toBottom: true });
+                  if (state.page === 'assets') renderAssets();
+                  showToast('生成完成（已从服务端同步）');
+                  return;
+                }
+              } catch (_) { /* ignore poll errors */ }
+            }
+            showToast('仍在生成或已结束，请刷新页面查看历史；勿连续点击发送');
             return;
           }
           const errMsg = data.error || `生成失败 (${resp.status})`;

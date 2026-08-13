@@ -777,8 +777,13 @@ function extractImages(apiResp) {
   return { images, texts };
 }
 
-/** 进行中的生成请求指纹，防止前端双发导致上游被调两次、落盘两条 */
-const inflightGenerates = new Set();
+/**
+ * 进行中的生成请求指纹（防前端双发）。
+ * 用 Map 记录开始时间：请求结束后立即释放；异常卡住时按 TTL 自动过期，避免一直「重复提交」。
+ */
+const inflightGenerates = new Map(); // fp -> startedAt(ms)
+/** 最长占用（需 ≥ 上游 timeout 360s，否则长图会误判可重入） */
+const INFLIGHT_TTL_MS = 6 * 60 * 1000;
 
 function generateFingerprint(body) {
   const prompt = String(body?.prompt || '').trim();
@@ -797,6 +802,16 @@ function generateFingerprint(body) {
   return `${model}|${ratio}|${size}|${prompt}|${imgs.length}|${refSig}`;
 }
 
+function pruneInflightLocks() {
+  const now = Date.now();
+  for (const [key, startedAt] of inflightGenerates) {
+    if (now - startedAt > INFLIGHT_TTL_MS) {
+      inflightGenerates.delete(key);
+      console.warn(`[generate] expired stale inflight lock age=${Math.round((now - startedAt) / 1000)}s`);
+    }
+  }
+}
+
 async function handleGenerate(req, res) {
   if (!API_KEY) {
     return sendJson(res, 500, {
@@ -813,16 +828,24 @@ async function handleGenerate(req, res) {
     return sendJson(res, 400, { ok: false, error: '请求 JSON 无效: ' + e.message });
   }
 
+  pruneInflightLocks();
   const fp = generateFingerprint(body);
-  if (inflightGenerates.has(fp)) {
-    console.warn(`[generate] reject duplicate in-flight request fp=${fp.slice(0, 80)}…`);
+  const prevStarted = inflightGenerates.get(fp);
+  if (prevStarted) {
+    const elapsedSec = Math.max(1, Math.round((Date.now() - prevStarted) / 1000));
+    const retryAfterSec = Math.max(1, Math.ceil((INFLIGHT_TTL_MS - (Date.now() - prevStarted)) / 1000));
+    console.warn(
+      `[generate] reject duplicate in-flight request elapsed=${elapsedSec}s fp=${fp.slice(0, 80)}…`
+    );
     return sendJson(res, 429, {
       ok: false,
-      error: '相同请求正在生成中，请勿重复提交',
+      error: `相同内容正在生成中（已进行 ${elapsedSec} 秒），请稍候，勿重复点击`,
       duplicate: true,
+      elapsedSec,
+      retryAfterSec,
     });
   }
-  inflightGenerates.add(fp);
+  inflightGenerates.set(fp, Date.now());
 
   const modelMeta = resolveModel(body.model || body.uiModel || DEFAULT_UI_MODEL);
   const reqSize = normalizeImageSize(body.imageSize || body.res || '1K');
