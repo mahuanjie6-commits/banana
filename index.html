@@ -4289,6 +4289,12 @@
       $('#configPage').classList.toggle('show', isConfig);
       $('#topbar').style.display = isBanana ? 'flex' : 'none';
       $('#historyPanel').style.display = isBanana ? '' : 'none';
+      if (!isBanana) {
+        // 离开 Banana 页时关掉历史抽屉遮罩
+        $('#historyBackdrop')?.classList.remove('show');
+      } else {
+        syncHistoryPanelUI();
+      }
       if (isAssets) {
         closeAssetDropdowns();
         closeDateRangePanel();
