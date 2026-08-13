@@ -65,8 +65,15 @@ const DEFAULT_MODEL_CONFIG = {
   },
 };
 
-// ---- 本地持久化：data/history.json + data/files/{id}/ + data/models-config.json ----
-const DATA_DIR = path.join(__dirname, 'data');
+// ---- 本地持久化：history.json + files/{id}/ + models-config.json ----
+// Render 免费实例磁盘是临时的，重启/重部署会清空项目目录。
+// 请设置环境变量 DATA_DIR 指向持久盘挂载点（如 /var/data），见 render.yaml / DEPLOY-RENDER.md
+function resolveDataDir() {
+  const fromEnv = String(process.env.DATA_DIR || '').trim();
+  if (fromEnv) return path.resolve(fromEnv);
+  return path.join(__dirname, 'data');
+}
+const DATA_DIR = resolveDataDir();
 const FILES_DIR = path.join(DATA_DIR, 'files');
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 const MODEL_CONFIG_FILE = path.join(DATA_DIR, 'models-config.json');
@@ -75,6 +82,50 @@ function ensureDataDirs() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(FILES_DIR)) fs.mkdirSync(FILES_DIR, { recursive: true });
   if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, '[]', 'utf8');
+  // 可选：从项目内默认 data/ 迁移一次（首次挂载空磁盘时）
+  maybeMigrateLegacyData();
+}
+
+let _legacyMigrated = false;
+function maybeMigrateLegacyData() {
+  if (_legacyMigrated) return;
+  _legacyMigrated = true;
+  try {
+    const legacy = path.join(__dirname, 'data');
+    if (path.resolve(legacy) === path.resolve(DATA_DIR)) return;
+    if (!fs.existsSync(legacy)) return;
+    // 仅当持久目录几乎为空时迁移
+    const histExists = fs.existsSync(HISTORY_FILE) && fs.statSync(HISTORY_FILE).size > 4;
+    if (histExists) return;
+    const legacyHist = path.join(legacy, 'history.json');
+    if (fs.existsSync(legacyHist)) {
+      fs.copyFileSync(legacyHist, HISTORY_FILE);
+      console.log(`[data] migrated history.json → ${HISTORY_FILE}`);
+    }
+    const legacyModels = path.join(legacy, 'models-config.json');
+    if (fs.existsSync(legacyModels) && !fs.existsSync(MODEL_CONFIG_FILE)) {
+      fs.copyFileSync(legacyModels, MODEL_CONFIG_FILE);
+      console.log(`[data] migrated models-config.json → ${MODEL_CONFIG_FILE}`);
+    }
+    const legacyFiles = path.join(legacy, 'files');
+    if (fs.existsSync(legacyFiles)) {
+      copyDirRecursive(legacyFiles, FILES_DIR);
+      console.log(`[data] migrated files/ → ${FILES_DIR}`);
+    }
+  } catch (e) {
+    console.warn('[data] legacy migrate skipped:', e.message);
+  }
+}
+
+function copyDirRecursive(src, dest) {
+  if (!fs.existsSync(src)) return;
+  if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
+  for (const name of fs.readdirSync(src)) {
+    const s = path.join(src, name);
+    const d = path.join(dest, name);
+    if (fs.statSync(s).isDirectory()) copyDirRecursive(s, d);
+    else if (!fs.existsSync(d)) fs.copyFileSync(s, d);
+  }
 }
 
 function cloneDefaultModelConfig() {
@@ -1046,6 +1097,11 @@ const server = http.createServer(async (req, res) => {
 
   if (method === 'GET' && (urlPath === '/api/health' || urlPath.startsWith('/api/health?'))) {
     const cfg = readModelConfig();
+    ensureDataDirs();
+    let historyCount = 0;
+    try {
+      historyCount = readHistoryStore().length;
+    } catch (_) { /* ignore */ }
     return sendJson(res, 200, {
       ok: true,
       baseUrl: BASE_URL,
@@ -1055,6 +1111,13 @@ const server = http.createServer(async (req, res) => {
       ),
       hasKey: Boolean(API_KEY),
       keyHint: API_KEY ? `${API_KEY.slice(0, 6)}…${API_KEY.slice(-4)}` : null,
+      dataDir: DATA_DIR,
+      dataDirFromEnv: Boolean(String(process.env.DATA_DIR || '').trim()),
+      historyCount,
+      // free 实例未挂盘时 dataDirFromEnv 多为 false，重启会丢数据
+      persistentHint: String(process.env.DATA_DIR || '').trim()
+        ? 'using DATA_DIR (expect persistent disk)'
+        : 'default ./data (ephemeral on most PaaS free tiers)',
     });
   }
 
@@ -1126,6 +1189,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  API Key:  ${API_KEY ? '已配置' : '未配置（请创建 .env 填入 JWMP_API_KEY）'}`);
   ensureDataDirs();
   const n = readHistoryStore().length;
+  console.log(`  数据目录: ${DATA_DIR}${process.env.DATA_DIR ? ' (DATA_DIR)' : ' (默认 ./data，部署重启可能丢失)'}`);
   console.log(`  本地记录: ${n} 条 → ${HISTORY_FILE}`);
   console.log(`  模型配置: ${MODEL_CONFIG_FILE}`);
   console.log('  ----------------------------------------');
