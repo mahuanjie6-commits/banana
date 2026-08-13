@@ -2,7 +2,10 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1" />
+  <meta name="theme-color" content="#f5f7fb" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <title>Banana · AI 图像生成</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -31,19 +34,41 @@
 
     html, body {
       height: 100%;
+      height: 100dvh;
       font-family: "PingFang SC", "Microsoft YaHei UI", "Segoe UI", system-ui, -apple-system, sans-serif;
       color: var(--text);
       background: var(--bg);
       font-size: 14px;
       -webkit-font-smoothing: antialiased;
       overflow: hidden;
+      /* 移动端橡皮筋滚动时减少露白 */
+      overscroll-behavior: none;
     }
 
     button, input, textarea { font: inherit; color: inherit; }
-    button { cursor: pointer; border: none; background: none; }
-    img, svg { display: block; }
+    button { cursor: pointer; border: none; background: none; -webkit-tap-highlight-color: transparent; }
+    img, svg { display: block; max-width: 100%; }
 
-    .app { display: flex; height: 100vh; width: 100vw; }
+    .app {
+      display: flex;
+      height: 100vh;
+      height: 100dvh;
+      width: 100vw;
+      max-width: 100%;
+      overflow: hidden;
+    }
+
+    /* 移动端历史抽屉遮罩 */
+    .history-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.38);
+      z-index: 35;
+      backdrop-filter: blur(2px);
+      -webkit-backdrop-filter: blur(2px);
+    }
+    .history-backdrop.show { display: block; }
 
     /* ========== Sidebar ========== */
     .sidebar {
@@ -2184,15 +2209,364 @@
     @media (max-width: 900px) {
       .detail-strip { display: none; }
       .detail-side { width: 260px; min-width: 260px; }
+      .history { display: none; }
+      .history.force {
+        display: flex;
+        position: fixed;
+        right: 0;
+        top: 0;
+        bottom: 0;
+        width: min(320px, 88vw);
+        min-width: min(320px, 88vw);
+        z-index: 40;
+        box-shadow: -8px 0 32px rgba(15, 23, 42, 0.14);
+        opacity: 1;
+        border-left: 1px solid var(--border);
+      }
+      .history.force.collapsed { display: none; }
     }
     @media (max-width: 700px) {
       .detail-body { flex-direction: column; }
       .detail-side { width: 100%; min-width: 0; max-height: 42vh; border-left: none; border-top: 1px solid #eef0f4; }
     }
 
-    @media (max-width: 900px) {
-      .history { display: none; }
-      .history.force { display: flex; position: absolute; right: 0; top: 0; bottom: 0; z-index: 40; box-shadow: -8px 0 24px rgba(0,0,0,.08); }
+    /* ========== 移动端 / 窄屏适配 ========== */
+    @media (max-width: 768px) {
+      .app {
+        flex-direction: column;
+        height: 100dvh;
+      }
+
+      /* 底栏导航 */
+      .sidebar {
+        order: 2;
+        width: 100%;
+        min-width: 0;
+        height: auto;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        padding: 4px 6px calc(4px + env(safe-area-inset-bottom, 0px));
+        border-right: none;
+        border-top: 1px solid var(--border);
+        background: rgba(250, 251, 252, 0.96);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        z-index: 50;
+      }
+      .sidebar .logo,
+      .sidebar .user-avatar {
+        display: none;
+      }
+      .side-nav {
+        flex-direction: row;
+        flex: 1;
+        justify-content: space-around;
+        align-items: stretch;
+        gap: 0;
+        padding: 0 4px;
+        width: 100%;
+      }
+      .nav-item {
+        flex: 1;
+        max-width: 120px;
+        padding: 8px 4px 6px;
+        border-radius: 12px;
+        gap: 2px;
+      }
+      .nav-item svg { width: 22px; height: 22px; }
+      .nav-item span { font-size: 10.5px; }
+
+      .main {
+        order: 1;
+        flex: 1;
+        min-height: 0;
+        width: 100%;
+      }
+
+      .topbar {
+        height: auto;
+        min-height: 48px;
+        padding: 8px 10px;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        padding-top: calc(8px + env(safe-area-inset-top, 0px));
+      }
+      .filter-btn,
+      .date-range-btn,
+      .collapse-btn {
+        height: 34px;
+        padding: 0 10px;
+        font-size: 12px;
+        border-radius: 9px;
+      }
+      .collapse-btn { margin-left: auto; }
+      #historyToggleText { font-size: 12px; }
+      .topbar-date-wrap { flex: 1; min-width: 0; max-width: 100%; }
+      .topbar-date-wrap .date-range-btn { width: 100%; justify-content: space-between; }
+      .topbar-date-wrap .date-range-panel {
+        left: 0;
+        right: 0;
+        width: min(100vw - 20px, 360px);
+        max-width: calc(100vw - 20px);
+      }
+
+      .workspace { min-height: 0; }
+
+      .feed {
+        padding: 8px 12px 200px;
+        -webkit-overflow-scrolling: touch;
+      }
+      .feed-inner { max-width: 100%; }
+      .feed-date { font-size: 14px; margin: 14px 0 10px; }
+
+      .message { padding: 4px 0 20px; }
+      .result-card {
+        max-width: 100%;
+        width: 100%;
+        padding: 8px;
+        border-radius: 12px;
+      }
+      .result-art { max-width: 100%; }
+      .msg-actions-bottom {
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .chip {
+        height: 32px;
+        padding: 0 10px;
+        font-size: 12px;
+      }
+      .msg-prompt {
+        font-size: 13.5px;
+        word-break: break-word;
+      }
+      .msg-ref-btn { width: 44px; height: 44px; }
+
+      .composer-wrap {
+        padding: 0 10px calc(10px + env(safe-area-inset-bottom, 0px));
+        /* 底栏之上 */
+        bottom: 0;
+        background: linear-gradient(180deg, transparent 0%, rgba(245,247,251,.75) 18%, var(--bg) 55%);
+      }
+      .composer {
+        max-width: 100%;
+        border-radius: 16px;
+        padding: 10px 10px 8px;
+      }
+      .composer-row { gap: 8px; }
+      .prompt-input {
+        /* iOS 避免自动放大 */
+        font-size: 16px;
+        min-height: 40px;
+        max-height: min(36vh, 220px);
+        padding: 8px 0;
+      }
+      .composer-toolbar {
+        padding-left: 0;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 8px;
+        row-gap: 8px;
+      }
+      .tool-select {
+        height: 32px;
+        padding: 0 8px;
+        font-size: 12px;
+        max-width: min(46vw, 180px);
+      }
+      .tool-select span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 9em;
+      }
+      .send-btn {
+        width: 36px;
+        height: 36px;
+        margin-left: auto;
+      }
+      .upload-btn { width: 40px; height: 40px; }
+      .attach-item,
+      .attach-add-btn { width: 56px; height: 56px; }
+      .dropdown {
+        left: 0;
+        right: auto;
+        min-width: 0;
+        width: min(300px, calc(100vw - 28px));
+        max-width: calc(100vw - 28px);
+      }
+      .ratio-panel {
+        left: 0;
+        width: min(320px, calc(100vw - 24px));
+        max-width: calc(100vw - 24px);
+      }
+      .ratio-grid { grid-template-columns: repeat(4, 1fr); gap: 6px; }
+
+      .empty-state { padding: 0 20px 160px; }
+      .generating {
+        padding: 12px 16px;
+        font-size: 13px;
+      }
+
+      /* 资产页 */
+      .assets-view { min-width: 0; }
+      .assets-top {
+        flex-wrap: wrap;
+        height: auto;
+        padding: 10px 12px;
+        gap: 8px;
+      }
+      .assets-tabs {
+        width: 100%;
+        height: auto;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+      .assets-filters {
+        width: 100%;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .assets-body { padding: 12px 12px 28px; }
+      .assets-grid {
+        grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+        gap: 8px;
+      }
+      .asset-card { border-radius: 10px; }
+      .assets-section-title { font-size: 14px; }
+      .batch-bar {
+        flex-wrap: wrap;
+        padding: 8px 12px;
+        gap: 8px;
+      }
+
+      /* 配置页 */
+      .config-top {
+        height: auto;
+        min-height: 48px;
+        padding: 10px 14px;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .config-top .hint {
+        margin-left: 0;
+        width: 100%;
+        line-height: 1.4;
+      }
+      .config-body { padding: 16px 12px 32px; }
+      .config-card { border-radius: 14px; overflow-x: auto; }
+      .config-table { min-width: 0; }
+      .config-table thead { display: none; }
+      .config-table tbody tr {
+        display: block;
+        padding: 12px 14px;
+        border-bottom: 1px solid #f1f5f9;
+      }
+      .config-table tbody td {
+        display: block;
+        padding: 4px 0;
+        border: none;
+        width: 100% !important;
+      }
+      .config-table .col-id {
+        font-size: 11px;
+        color: #94a3b8;
+        margin-bottom: 2px;
+      }
+      .config-table .col-name {
+        font-size: 14px;
+        margin-bottom: 8px;
+      }
+      .config-footer {
+        flex-wrap: wrap;
+        gap: 10px;
+        padding: 12px 14px;
+      }
+
+      /* 详情全屏 */
+      .detail-close-wrap {
+        right: 12px;
+        top: calc(12px + env(safe-area-inset-top, 0px));
+      }
+      .detail-main {
+        padding: 52px 12px 16px;
+      }
+      .detail-main-inner {
+        max-width: 100%;
+        max-height: none;
+      }
+      .detail-main-inner > img {
+        max-width: 100%;
+        max-height: min(58vh, 520px);
+        border-radius: 12px;
+      }
+      .detail-main-svg {
+        width: 100%;
+        height: auto;
+        min-height: 240px;
+        max-height: 58vh;
+        padding: 12px;
+      }
+      .detail-side {
+        max-height: 40vh;
+        -webkit-overflow-scrolling: touch;
+      }
+      .detail-side-toolbar { padding: 10px 12px; }
+      .detail-icon-btn { width: 38px; height: 38px; }
+
+      .toast {
+        top: calc(12px + env(safe-area-inset-top, 0px));
+        max-width: calc(100vw - 32px);
+        font-size: 13px;
+        padding: 10px 14px;
+        text-align: center;
+      }
+
+      .hist-pos {
+        top: calc(56px + env(safe-area-inset-top, 0px));
+        max-width: calc(100vw - 24px);
+      }
+
+      .date-range-panel .dr-fields {
+        flex-direction: column;
+        gap: 8px;
+      }
+      .date-range-panel .dr-sep { display: none; }
+      .dr-presets {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      /* 历史抽屉：避开底部导航 */
+      .history.force {
+        top: 0;
+        bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+        width: min(300px, 86vw);
+        min-width: min(300px, 86vw);
+        border-radius: 0;
+      }
+    }
+
+    @media (max-width: 420px) {
+      .assets-grid {
+        grid-template-columns: repeat(3, 1fr);
+        gap: 6px;
+      }
+      .filter-btn { display: none; }
+      .tool-select span { max-width: 6.5em; }
+      .composer-toolbar .tool-select { max-width: 42vw; }
+    }
+
+    /* 横屏手机：底栏稍矮，多给内容区 */
+    @media (max-width: 900px) and (max-height: 480px) and (orientation: landscape) {
+      .sidebar { padding: 2px 4px; }
+      .nav-item { padding: 4px 2px; }
+      .nav-item span { display: none; }
+      .feed { padding-bottom: 140px; }
+      .composer-wrap { padding-bottom: 6px; }
     }
   </style>
 </head>
@@ -2409,6 +2783,7 @@
   </svg>
 
   <div class="app">
+    <div class="history-backdrop" id="historyBackdrop" aria-hidden="true"></div>
     <aside class="sidebar">
       <div class="logo" title="Banana">
         <svg viewBox="0 0 24 24" fill="none">
@@ -3138,7 +3513,10 @@
       model: 'pro',
       ratio: '1:1',
       res: '2K',
-      historyOpen: true,
+      // 窄屏默认收起历史，避免一进来就盖住主内容
+      historyOpen: typeof window !== 'undefined'
+        ? !window.matchMedia('(max-width: 900px)').matches
+        : true,
       attachments: [],
       currentId: 1,
       generating: false,
@@ -4591,10 +4969,43 @@
     $$('.nav-item').forEach(btn => btn.addEventListener('click', () => switchPage(btn.dataset.page)));
     $('#configSaveBtn')?.addEventListener('click', () => saveModelConfig());
 
+    function isMobileLayout() {
+      return window.matchMedia('(max-width: 900px)').matches;
+    }
+
+    function syncHistoryPanelUI() {
+      const panel = $('#historyPanel');
+      const backdrop = $('#historyBackdrop');
+      const mobile = isMobileLayout();
+      if (!panel) return;
+      if (mobile) {
+        // 移动端：用 force 抽屉；展开时去掉 collapsed
+        panel.classList.toggle('force', !!state.historyOpen);
+        panel.classList.toggle('collapsed', !state.historyOpen);
+        backdrop?.classList.toggle('show', !!state.historyOpen);
+        if (backdrop) backdrop.setAttribute('aria-hidden', state.historyOpen ? 'false' : 'true');
+      } else {
+        panel.classList.remove('force');
+        panel.classList.toggle('collapsed', !state.historyOpen);
+        backdrop?.classList.remove('show');
+        if (backdrop) backdrop.setAttribute('aria-hidden', 'true');
+      }
+      const label = $('#historyToggleText');
+      if (label) label.textContent = state.historyOpen ? '收起历史' : '历史记录';
+    }
+
     $('#toggleHistory').addEventListener('click', () => {
       state.historyOpen = !state.historyOpen;
-      $('#historyPanel').classList.toggle('collapsed', !state.historyOpen);
-      $('#historyToggleText').textContent = state.historyOpen ? '收起历史记录' : '展开历史记录';
+      syncHistoryPanelUI();
+    });
+    $('#historyBackdrop')?.addEventListener('click', () => {
+      if (!state.historyOpen) return;
+      state.historyOpen = false;
+      syncHistoryPanelUI();
+    });
+    window.addEventListener('resize', () => {
+      // 切到桌面时收起抽屉遮罩
+      syncHistoryPanelUI();
     });
 
     $('#modelBtn').addEventListener('click', e => {
@@ -4876,6 +5287,11 @@
       // 点击历史：定位到主时间线对应内容（不进详情）
       if (state.page !== 'banana') switchPage('banana');
       loadHistory(id, { silent: true });
+      // 移动端选中后收起抽屉，露出主内容
+      if (isMobileLayout() && state.historyOpen) {
+        state.historyOpen = false;
+        syncHistoryPanelUI();
+      }
     });
 
     // 资产页：Tab
@@ -5303,6 +5719,7 @@
     renderRatios();
     syncResUI();
     updateSendState();
+    syncHistoryPanelUI();
 
     const bananaPage = $('#bananaPage');
     bananaPage.style.display = 'flex';
