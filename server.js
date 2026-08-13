@@ -386,7 +386,8 @@ function persistGenerateResult({ body, modelMeta, images, texts, upstream }) {
     featured: false,
     apiModel: modelMeta.id,
     modelVersion: upstream?.modelVersion || modelMeta.id,
-    replyText: (texts || []).join('\n'),
+    // 上游常返回 "Image generated successfully." 等套话，界面不再展示
+    replyText: '',
     responseId: upstream?.responseId || '',
     usageMetadata: upstream?.usageMetadata || null,
     imageFiles,

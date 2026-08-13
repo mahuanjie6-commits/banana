@@ -3311,7 +3311,6 @@
               <div class="art-inner">${artHTML(item)}</div>
             </div>
           </div>
-          ${item.replyText ? `<div class="msg-reply">${escapeHtml(item.replyText)}</div>` : ''}
           <div class="msg-actions-bottom">
             <button class="chip" data-action="reedit" data-id="${item.id}">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
@@ -3647,11 +3646,6 @@
           <div class="detail-meta-line">创作人：${escapeHtml(item.user || '-')}</div>
           <div class="detail-meta-line">时间：${escapeHtml(item.time || '-')}</div>
         </div>
-        ${item.replyText ? `
-          <div class="detail-block">
-            <div class="detail-label">模型说明</div>
-            <div class="detail-prompt" style="color:#64748b;font-size:12.5px;">${escapeHtml(item.replyText)}</div>
-          </div>` : ''}
       `;
 
       // 收藏按钮状态
@@ -4501,7 +4495,7 @@
           res: state.res,
           modelVersion: data.modelVersion || data.model || '',
           apiModel: data.model || '',
-          replyText: (data.texts || []).join('\n'),
+          replyText: '',
           responseId: data.responseId,
           active: true,
           inHistory: true,
