@@ -50,7 +50,7 @@ const DEFAULT_MODEL_CONFIG = {
     maxImages: 3,
   },
   nano2: {
-    id: (process.env.JWMP_MODEL_NANO2 || 'gemini-3.1-flash-image-preview').trim(),
+    id: (process.env.JWMP_MODEL_NANO2 || 'gemini-3.1-flash-image-preview-hq').trim(),
     label: 'Nano Banana 2',
     price: '0.4元/张',
     supportsImageSize: true,
