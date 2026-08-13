@@ -41,7 +41,7 @@ const API_KEY = PLACEHOLDER_KEYS.has(RAW_KEY.trim()) ? '' : RAW_KEY.trim();
  * UI 模型档位 → 上游真实模型（可在「配置」页自定义，持久化到 data/models-config.json）
  * 默认值也可通过环境变量 JWMP_MODEL_NANO / NANO2 / PRO 覆盖
  */
-const DEFAULT_UI_MODEL = 'pro';
+const DEFAULT_UI_MODEL = 'nano2';
 const UI_MODEL_KEYS = ['nano', 'nano2', 'pro'];
 
 const DEFAULT_MODEL_CONFIG = {
@@ -1084,7 +1084,7 @@ server.listen(PORT, '0.0.0.0', () => {
   (async () => {
     try {
       const bootCfg = await readModelConfig();
-      console.log(`  默认:     Nano Banana Pro → ${bootCfg.pro.id}`);
+      console.log(`  默认:     Nano Banana 2 → ${bootCfg.nano2.id}`);
       console.log(`  映射:     nano → ${bootCfg.nano.id}`);
       console.log(`           nano2 → ${bootCfg.nano2.id}`);
       console.log(`           pro → ${bootCfg.pro.id}`);

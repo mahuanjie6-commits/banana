@@ -2900,11 +2900,11 @@
               <div class="composer-toolbar">
                 <div class="tool-select-wrap" id="modelSelectWrap">
                   <button class="tool-select" id="modelBtn" type="button">
-                    <span id="modelBtnText">Nano Banana Pro（0.8元/张）</span>
+                    <span id="modelBtnText">Nano Banana 2（0.4元/张）</span>
                     <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
                   </button>
                   <div class="dropdown" id="modelDropdown">
-                    <button class="model-option" data-model="nano2" data-label="Nano Banana 2（0.4元/张）" data-api="gemini-3.1-flash-image-preview-hq">
+                    <button class="model-option selected" data-model="nano2" data-label="Nano Banana 2（0.4元/张）" data-api="gemini-3.1-flash-image-preview-hq">
                       <div class="body">
                         <div class="title">Nano Banana 2（0.4元/张） <span class="badge-new">NEW</span></div>
                         <div class="desc">速度快，适合较高质量图片的快速生成。</div>
@@ -2918,7 +2918,7 @@
                       </div>
                       <svg class="check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5L20 7"/></svg>
                     </button>
-                    <button class="model-option selected" data-model="pro" data-label="Nano Banana Pro（0.8元/张）" data-api="gemini-3-pro-image-preview-hq">
+                    <button class="model-option" data-model="pro" data-label="Nano Banana Pro（0.8元/张）" data-api="gemini-3-pro-image-preview-hq">
                       <div class="body">
                         <div class="title">Nano Banana Pro（0.8元/张）</div>
                         <div class="desc">质量高，支持思维链输出 · gemini-3-pro-image-preview-hq</div>
@@ -2930,7 +2930,7 @@
                 <div class="tool-select-wrap" id="ratioSelectWrap">
                   <button class="tool-select" id="ratioBtn" type="button">
                     <span class="ratio-box" id="ratioIcon"></span>
-                    <span id="ratioBtnText">1:1 2K</span>
+                    <span id="ratioBtnText">智能 1K</span>
                     <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
                   </button>
                   <div class="ratio-panel" id="ratioPanel">
@@ -2939,8 +2939,8 @@
                     <div id="resSection">
                       <div class="panel-label">选择分辨率</div>
                       <div class="res-row" id="resRow">
-                        <button class="res-btn" data-res="1K">1K</button>
-                        <button class="res-btn selected" data-res="2K">2K</button>
+                        <button class="res-btn selected" data-res="1K">1K</button>
+                        <button class="res-btn" data-res="2K">2K</button>
                         <button class="res-btn" data-res="4K">4K</button>
                       </div>
                     </div>
@@ -3510,9 +3510,9 @@
     const _defaultDates = rangeForPreset('all');
     const state = {
       page: 'banana',
-      model: 'pro',
-      ratio: '1:1',
-      res: '2K',
+      model: 'nano2',
+      ratio: 'auto',
+      res: '1K',
       // 窄屏默认收起历史，避免一进来就盖住主内容
       historyOpen: typeof window !== 'undefined'
         ? !window.matchMedia('(max-width: 900px)').matches
@@ -4734,7 +4734,7 @@
         const useRes = modelSupportsRes(state.model) ? (state.res || '1K') : '1K';
         const payload = {
           // pro = Nano Banana Pro → gemini-3-pro-image-preview-hq
-          model: state.model || 'pro',
+          model: state.model || 'nano2',
           prompt: finalPrompt,
           aspectRatio: mapRatioForApi(state.ratio),
           imageSize: useRes,
@@ -5037,7 +5037,7 @@
     $('#modelDropdown').addEventListener('click', e => {
       const opt = e.target.closest('.model-option');
       if (!opt) return;
-      state.model = opt.dataset.model || 'pro';
+      state.model = opt.dataset.model || 'nano2';
       $$('.model-option').forEach(o => o.classList.toggle('selected', o === opt));
       $('#modelBtnText').textContent = opt.dataset.label;
       syncResUI();
