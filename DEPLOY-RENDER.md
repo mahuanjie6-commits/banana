@@ -47,38 +47,38 @@
 - 免费实例约 **15 分钟无访问会休眠**，下次打开需等 30–60 秒唤醒  
 - **不要**把 `.env` 推到 GitHub（已在 `.gitignore`）
 
-## 生成数据被清空？——持久化说明
+## 生成数据被清空？——用 Cloudflare R2（推荐，可免费）
 
 ### 原因
 
-历史与图片写在服务器磁盘的 `data/`（或 `DATA_DIR`）里。  
-**Render Free 的磁盘是临时的**：每次 **Redeploy / 重启 / 休眠唤醒重建** 都可能清空，所以看起来「一更新数据就没了」。
+历史与图片默认写在服务器本机磁盘。  
+**Render Free 磁盘是临时的**，Redeploy / 重启会清空。
 
-### 解决办法（推荐）：挂载持久磁盘
+### 推荐：Cloudflare R2（Free 实例也够用）
 
-1. 打开服务 **banana** → **Settings**  
-2. 实例类型至少 **Starter**（Free **不支持** Persistent Disk）  
-3. **Disks** → **Add Disk**：  
-   - Name: `banana-data`  
-   - Mount path: `/var/data`  
-   - Size: `1 GB`（可按需加大）  
-4. **Environment** 增加或修改：  
+1. 打开 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **R2** → 创建桶，例如 `banana-data`  
+2. **Manage R2 API Tokens** → 创建 Token（需对象读/写权限）  
+3. 记下 **Account ID**、**Access Key ID**、**Secret Access Key**  
+4. Render 服务 **Environment** 添加：
 
 | Key | Value |
 |-----|--------|
-| `DATA_DIR` | `/var/data` |
+| `R2_ACCOUNT_ID` | Cloudflare 账户 ID |
+| `R2_ACCESS_KEY_ID` | API Token Access Key |
+| `R2_SECRET_ACCESS_KEY` | API Token Secret |
+| `R2_BUCKET` | `banana-data`（你的桶名） |
 
-5. **Manual Deploy** → 重新部署  
-6. 打开 `/api/health`，确认：  
-   - `"dataDir": "/var/data"`  
-   - `"dataDirFromEnv": true`  
+5. **Manual Deploy** 一次  
+6. 打开 `/api/health`，应看到：  
+   - `"storage": "r2"`  
+   - `"persistentHint": "using Cloudflare R2..."`  
 
-仓库里的 `render.yaml` 已按 **Starter + 1GB 盘 + DATA_DIR** 写好；用 Blueprint 同步或按上表在控制台改即可。
+之后重部署 **不会丢** 历史和图片（数据在 R2）。
+
+### 备选：Render 付费挂盘
+
+Starter + Disk + `DATA_DIR=/var/data`（不配 R2 时）。见平台文档。
 
 ### 本地开发
 
-不设 `DATA_DIR` 时仍用项目下 `./data/`，本机重启不会丢（除非你删了文件夹）。
-
-### 仍用 Free 的局限
-
-可以继续免费试用，但**无法保证**历史与图片在重部署后还在。只能接受数据临时性，或升级并挂盘。
+不配 `R2_*` 时仍用 `./data/`，本机正常。

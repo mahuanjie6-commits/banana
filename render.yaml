@@ -1,22 +1,15 @@
 # Render Blueprint
-# 文档: https://render.com/docs/blueprint-spec
-#
-# 重要：Free 实例没有持久磁盘，重启/重部署会清空生成历史与图片。
-# 需要保留数据时请用 starter（或更高）并挂载 disk（如下配置）。
+# 推荐：Free + Cloudflare R2（环境变量填 R2_*，无需挂盘）
+# 备选：Starter + disk + DATA_DIR（不配 R2 时）
 services:
   - type: web
     name: banana
     runtime: node
-    # free 不支持 disk；要持久化请保持 starter
-    plan: starter
+    plan: free
     region: singapore
-    buildCommand: "npm run build"
+    buildCommand: "npm install --omit=dev"
     startCommand: "node server.js"
     healthCheckPath: /api/health
-    disk:
-      name: banana-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: NODE_VERSION
         value: "20.18.0"
@@ -28,6 +21,12 @@ services:
         value: gemini-3-pro-image-preview-hq
       - key: JWMP_MODEL_NANO2
         value: gemini-3.1-flash-image-preview-hq
-      # 数据写入持久盘（与上面 mountPath 一致）
-      - key: DATA_DIR
-        value: /var/data
+      # Cloudflare R2（控制台填真实值；四个都配齐才启用）
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false

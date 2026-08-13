@@ -61,9 +61,8 @@ data/   或  $DATA_DIR/
 
 本机重启后历史可恢复。删除资产会同时删掉对应文件。
 
-> **部署到 Render 等平台时**：Free 实例磁盘通常是临时的，重部署会丢数据。  
-> 请挂载持久盘，并设置 `DATA_DIR=/var/data`（详见 `DEPLOY-RENDER.md`）。
-
+> **部署到 Render 等平台时**：Free 实例磁盘通常是临时的。  
+> **推荐配置 Cloudflare R2**（环境变量 `R2_*`），重启不丢数据；详见 `DEPLOY-RENDER.md`。
 ## 注意
 
 - **不要**直接双击打开 `index.html`，必须通过本地服务访问，否则无法调用接口。

@@ -28,6 +28,9 @@ function loadEnv() {
 }
 loadEnv();
 
+// 必须在 loadEnv 之后再加载，才能读到 .env 里的 R2_* / DATA_DIR
+const storage = require('./storage');
+
 const PORT = Number(process.env.PORT || 3780);
 const BASE_URL = (process.env.JWMP_BASE_URL || 'https://kwjm.com').replace(/\/$/, '');
 const RAW_KEY = process.env.JWMP_API_KEY || process.env.API_KEY || '';
@@ -65,68 +68,8 @@ const DEFAULT_MODEL_CONFIG = {
   },
 };
 
-// ---- 本地持久化：history.json + files/{id}/ + models-config.json ----
-// Render 免费实例磁盘是临时的，重启/重部署会清空项目目录。
-// 请设置环境变量 DATA_DIR 指向持久盘挂载点（如 /var/data），见 render.yaml / DEPLOY-RENDER.md
-function resolveDataDir() {
-  const fromEnv = String(process.env.DATA_DIR || '').trim();
-  if (fromEnv) return path.resolve(fromEnv);
-  return path.join(__dirname, 'data');
-}
-const DATA_DIR = resolveDataDir();
-const FILES_DIR = path.join(DATA_DIR, 'files');
-const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
-const MODEL_CONFIG_FILE = path.join(DATA_DIR, 'models-config.json');
-
-function ensureDataDirs() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(FILES_DIR)) fs.mkdirSync(FILES_DIR, { recursive: true });
-  if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, '[]', 'utf8');
-  // 可选：从项目内默认 data/ 迁移一次（首次挂载空磁盘时）
-  maybeMigrateLegacyData();
-}
-
-let _legacyMigrated = false;
-function maybeMigrateLegacyData() {
-  if (_legacyMigrated) return;
-  _legacyMigrated = true;
-  try {
-    const legacy = path.join(__dirname, 'data');
-    if (path.resolve(legacy) === path.resolve(DATA_DIR)) return;
-    if (!fs.existsSync(legacy)) return;
-    // 仅当持久目录几乎为空时迁移
-    const histExists = fs.existsSync(HISTORY_FILE) && fs.statSync(HISTORY_FILE).size > 4;
-    if (histExists) return;
-    const legacyHist = path.join(legacy, 'history.json');
-    if (fs.existsSync(legacyHist)) {
-      fs.copyFileSync(legacyHist, HISTORY_FILE);
-      console.log(`[data] migrated history.json → ${HISTORY_FILE}`);
-    }
-    const legacyModels = path.join(legacy, 'models-config.json');
-    if (fs.existsSync(legacyModels) && !fs.existsSync(MODEL_CONFIG_FILE)) {
-      fs.copyFileSync(legacyModels, MODEL_CONFIG_FILE);
-      console.log(`[data] migrated models-config.json → ${MODEL_CONFIG_FILE}`);
-    }
-    const legacyFiles = path.join(legacy, 'files');
-    if (fs.existsSync(legacyFiles)) {
-      copyDirRecursive(legacyFiles, FILES_DIR);
-      console.log(`[data] migrated files/ → ${FILES_DIR}`);
-    }
-  } catch (e) {
-    console.warn('[data] legacy migrate skipped:', e.message);
-  }
-}
-
-function copyDirRecursive(src, dest) {
-  if (!fs.existsSync(src)) return;
-  if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
-  for (const name of fs.readdirSync(src)) {
-    const s = path.join(src, name);
-    const d = path.join(dest, name);
-    if (fs.statSync(s).isDirectory()) copyDirRecursive(s, d);
-    else if (!fs.existsSync(d)) fs.copyFileSync(s, d);
-  }
-}
+// ---- 持久化：本地 DATA_DIR 或 Cloudflare R2（见 storage.js）----
+const DATA_DIR = storage.DATA_DIR;
 
 function cloneDefaultModelConfig() {
   const out = {};
@@ -137,19 +80,17 @@ function cloneDefaultModelConfig() {
 }
 
 /** 读取模型配置；文件缺失/损坏时回退默认值 */
-function readModelConfig() {
-  ensureDataDirs();
+async function readModelConfig() {
   const base = cloneDefaultModelConfig();
   try {
-    if (!fs.existsSync(MODEL_CONFIG_FILE)) return base;
-    const raw = JSON.parse(fs.readFileSync(MODEL_CONFIG_FILE, 'utf8') || '{}');
+    await storage.ensureStorageReady();
+    const raw = await storage.readModelsRaw();
     if (!raw || typeof raw !== 'object') return base;
     for (const key of UI_MODEL_KEYS) {
       const item = raw[key];
       if (!item || typeof item !== 'object') continue;
       const id = String(item.id || item.model || item.value || '').trim();
       if (id) base[key].id = id;
-      // 仅允许覆盖 id；label/price/supportsImageSize 以产品档位为准
     }
   } catch (e) {
     console.warn('[model-config] read failed:', e.message);
@@ -157,9 +98,8 @@ function readModelConfig() {
   return base;
 }
 
-function writeModelConfig(partial) {
-  ensureDataDirs();
-  const current = readModelConfig();
+async function writeModelConfig(partial) {
+  const current = await readModelConfig();
   for (const key of UI_MODEL_KEYS) {
     const item = partial && partial[key];
     if (!item) continue;
@@ -169,7 +109,6 @@ function writeModelConfig(partial) {
       err.status = 400;
       throw err;
     }
-    // 简单校验：允许字母数字、点、横线、下划线、中括号等常见模型名
     if (id.length > 200) {
       const err = new Error(`${current[key].label} 的模型值过长`);
       err.status = 400;
@@ -177,18 +116,17 @@ function writeModelConfig(partial) {
     }
     current[key].id = id;
   }
-  // 只持久化可编辑字段
   const toSave = {};
   for (const key of UI_MODEL_KEYS) {
     toSave[key] = { id: current[key].id };
   }
-  fs.writeFileSync(MODEL_CONFIG_FILE, JSON.stringify(toSave, null, 2), 'utf8');
+  await storage.writeModelsRaw(toSave);
   return current;
 }
 
 /** 根据当前配置构建 MODEL_MAP（含上游 id 别名） */
 function buildModelMap(cfg) {
-  const config = cfg || readModelConfig();
+  const config = cfg;
   const map = {};
   for (const key of UI_MODEL_KEYS) {
     const meta = {
@@ -200,27 +138,24 @@ function buildModelMap(cfg) {
       uiKey: key,
     };
     map[key] = meta;
-    // 上游 id 也可直接匹配到该档位
     if (meta.id) map[meta.id] = meta;
   }
-  // 兼容旧上游名 → 当前 Pro 映射
   const proId = config.pro.id;
   map['gemini-3-pro-image-preview'] = map.pro;
   map['gemini-3-pro-image-preview-hq'] = map.pro;
-  if (proId) {
-    map[proId] = map.pro;
-  }
+  if (proId) map[proId] = map.pro;
   map['gemini-3.1-flash-image-preview'] = map.nano2;
+  map['gemini-3.1-flash-image-preview-hq'] = map.nano2;
   map['gemini-2.5-flash-image'] = map.nano;
   return map;
 }
 
-function getModelMap() {
-  return buildModelMap(readModelConfig());
+async function getModelMap() {
+  return buildModelMap(await readModelConfig());
 }
 
-function listModelConfigForApi() {
-  const cfg = readModelConfig();
+async function listModelConfigForApi() {
+  const cfg = await readModelConfig();
   return UI_MODEL_KEYS.map((key, index) => ({
     id: index + 1,
     key,
@@ -235,14 +170,15 @@ function listModelConfigForApi() {
 }
 
 async function handleGetModelConfig(req, res) {
+  const cfg = await readModelConfig();
   return sendJson(res, 200, {
     ok: true,
-    models: listModelConfigForApi(),
+    models: await listModelConfigForApi(),
     map: Object.fromEntries(
-      UI_MODEL_KEYS.map((k) => {
-        const cfg = readModelConfig()[k];
-        return [k, { id: cfg.id, label: cfg.label, price: cfg.price, supportsImageSize: cfg.supportsImageSize }];
-      })
+      UI_MODEL_KEYS.map((k) => [
+        k,
+        { id: cfg[k].id, label: cfg[k].label, price: cfg[k].price, supportsImageSize: cfg[k].supportsImageSize },
+      ])
     ),
   });
 }
@@ -256,7 +192,6 @@ async function handleSaveModelConfig(req, res) {
     } catch (e) {
       return sendJson(res, 400, { ok: false, error: '无效的 JSON 请求体' });
     }
-    // 支持 { models: [{key,value}] } 或 { nano:{id}, nano2:{id}, pro:{id} }
     let partial = {};
     if (Array.isArray(body.models)) {
       for (const row of body.models) {
@@ -275,11 +210,11 @@ async function handleSaveModelConfig(req, res) {
     if (!Object.keys(partial).length) {
       return sendJson(res, 400, { ok: false, error: '请提供要更新的模型配置' });
     }
-    const saved = writeModelConfig(partial);
+    const saved = await writeModelConfig(partial);
     console.log('[model-config] saved', Object.fromEntries(UI_MODEL_KEYS.map((k) => [k, saved[k].id])));
     return sendJson(res, 200, {
       ok: true,
-      models: listModelConfigForApi(),
+      models: await listModelConfigForApi(),
       map: Object.fromEntries(
         UI_MODEL_KEYS.map((k) => [k, { id: saved[k].id, label: saved[k].label, price: saved[k].price }])
       ),
@@ -289,20 +224,12 @@ async function handleSaveModelConfig(req, res) {
   }
 }
 
-function readHistoryStore() {
-  ensureDataDirs();
-  try {
-    const raw = fs.readFileSync(HISTORY_FILE, 'utf8');
-    const list = JSON.parse(raw || '[]');
-    return Array.isArray(list) ? list : [];
-  } catch {
-    return [];
-  }
+async function readHistoryStore() {
+  return storage.readHistoryStore();
 }
 
-function writeHistoryStore(list) {
-  ensureDataDirs();
-  fs.writeFileSync(HISTORY_FILE, JSON.stringify(list, null, 2), 'utf8');
+async function writeHistoryStore(list) {
+  return storage.writeHistoryStore(list);
 }
 
 function mimeToExt(mime) {
@@ -321,15 +248,13 @@ function formatLocalDateTime(d = new Date()) {
 }
 
 /**
- * 从 /api/files/{id}/{file} 或完整 URL 读取本地落盘图片，返回 base64
- * 用于「重新编辑」场景：前端可能把 ref 路径当 data 提交
+ * 从 /api/files/{id}/{file} 或完整 URL 读取已存图片，返回 base64
+ * 用于「重新编辑」场景
  */
-function loadLocalFileAsBase64(raw) {
+async function loadLocalFileAsBase64(raw) {
   try {
     let s = String(raw || '').trim();
-    // 去掉 query / hash
     s = s.split('?')[0].split('#')[0];
-    // 完整 URL → 路径
     const abs = s.match(/^https?:\/\/[^/]+(\/api\/files\/.+)$/i);
     if (abs) s = abs[1];
     if (s.startsWith('api/files/')) s = '/' + s;
@@ -338,15 +263,13 @@ function loadLocalFileAsBase64(raw) {
     const id = decodeURIComponent(m[1]).replace(/[^a-zA-Z0-9_-]/g, '');
     const fileName = path.basename(decodeURIComponent(m[2]));
     if (!id || !fileName || fileName.includes('..')) return null;
-    const full = path.join(FILES_DIR, id, fileName);
-    if (!fs.existsSync(full)) return null;
-    const buf = fs.readFileSync(full);
+    const buf = await storage.getFileBuffer(id, fileName);
+    if (!buf) return null;
     const ext = path.extname(fileName).toLowerCase();
     let mimeType = 'image/png';
     if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
     else if (ext === '.webp') mimeType = 'image/webp';
     else if (ext === '.gif') mimeType = 'image/gif';
-    else if (ext === '.png') mimeType = 'image/png';
     return { base64: buf.toString('base64'), mimeType };
   } catch (e) {
     console.warn('[loadLocalFileAsBase64]', e.message);
@@ -358,28 +281,19 @@ function parseDataUrl(dataUrl) {
   const s = String(dataUrl || '');
   const m = s.match(/^data:([^;]+);base64,(.+)$/);
   if (m) return { mimeType: m[1], base64: m[2] };
-  // 纯 base64
   if (/^[A-Za-z0-9+/=\s]+$/.test(s) && s.length > 64) {
     return { mimeType: 'image/png', base64: s.replace(/\s/g, '') };
   }
   return null;
 }
 
-function saveImageBuffer(recordId, fileName, buffer) {
-  const dir = path.join(FILES_DIR, String(recordId));
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const fp = path.join(dir, fileName);
-  fs.writeFileSync(fp, buffer);
-  return fileName;
-}
-
-function saveDataUrlAsFile(recordId, fileNameBase, dataUrl, mimeHint) {
+async function saveDataUrlAsFile(recordId, fileNameBase, dataUrl, mimeHint) {
   const parsed = parseDataUrl(dataUrl);
   if (!parsed) return null;
   const ext = mimeToExt(parsed.mimeType || mimeHint);
   const fileName = `${fileNameBase}.${ext}`;
   const buf = Buffer.from(parsed.base64, 'base64');
-  return saveImageBuffer(recordId, fileName, buf);
+  return storage.putFileBuffer(recordId, fileName, buf, parsed.mimeType || mimeHint);
 }
 
 function enrichHistoryItem(item) {
@@ -405,22 +319,23 @@ function enrichHistoryItem(item) {
   };
 }
 
-function persistGenerateResult({ body, modelMeta, images, texts, upstream }) {
+async function persistGenerateResult({ body, modelMeta, images, texts, upstream }) {
   const id = Date.now();
   const imageFiles = [];
-  images.forEach((img, i) => {
-    const name = saveDataUrlAsFile(id, String(i), img.dataUrl, img.mimeType);
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    const name = await saveDataUrlAsFile(id, String(i), img.dataUrl, img.mimeType);
     if (name) imageFiles.push(name);
-  });
+  }
 
-  // 可选：保存参考图（限制数量，避免爆盘）
   const refFiles = [];
   const refs = Array.isArray(body.images) ? body.images.slice(0, 6) : [];
-  refs.forEach((img, i) => {
-    if (!img.data) return;
-    const name = saveDataUrlAsFile(id, `ref-${i}`, img.data, img.mimeType);
+  for (let i = 0; i < refs.length; i++) {
+    const img = refs[i];
+    if (!img.data) continue;
+    const name = await saveDataUrlAsFile(id, `ref-${i}`, img.data, img.mimeType);
     if (name) refFiles.push(name);
-  });
+  }
 
   const record = {
     id,
@@ -437,7 +352,6 @@ function persistGenerateResult({ body, modelMeta, images, texts, upstream }) {
     featured: false,
     apiModel: modelMeta.id,
     modelVersion: upstream?.modelVersion || modelMeta.id,
-    // 上游常返回 "Image generated successfully." 等套话，界面不再展示
     replyText: '',
     responseId: upstream?.responseId || '',
     usageMetadata: upstream?.usageMetadata || null,
@@ -447,24 +361,23 @@ function persistGenerateResult({ body, modelMeta, images, texts, upstream }) {
     persisted: true,
   };
 
-  const list = readHistoryStore();
+  const list = await readHistoryStore();
   list.unshift(record);
-  // 最多保留 500 条元数据（文件仍可能残留，可后续清理）
   if (list.length > 500) list.length = 500;
-  writeHistoryStore(list);
+  await writeHistoryStore(list);
   return enrichHistoryItem(record);
 }
 
-function persistFailRecord({ body, error }) {
+async function persistFailRecord({ body, error }) {
   const id = Date.now();
-  // 失败时也保存参考图，便于「重新编辑 / 再次生成」回填
   const refFiles = [];
   const refs = Array.isArray(body?.images) ? body.images.slice(0, 6) : [];
-  refs.forEach((img, i) => {
-    if (!img?.data) return;
-    const name = saveDataUrlAsFile(id, `ref-${i}`, img.data, img.mimeType);
+  for (let i = 0; i < refs.length; i++) {
+    const img = refs[i];
+    if (!img?.data) continue;
+    const name = await saveDataUrlAsFile(id, `ref-${i}`, img.data, img.mimeType);
     if (name) refFiles.push(name);
-  });
+  }
 
   const record = {
     id,
@@ -483,16 +396,15 @@ function persistFailRecord({ body, error }) {
     inHistory: true,
     persisted: true,
   };
-  const list = readHistoryStore();
+  const list = await readHistoryStore();
   list.unshift(record);
   if (list.length > 500) list.length = 500;
-  writeHistoryStore(list);
-  // enrich 后带 refImages 路径，前端可直接回填
+  await writeHistoryStore(list);
   return enrichHistoryItem(record);
 }
 
-function updateHistoryRecord(id, patch) {
-  const list = readHistoryStore();
+async function updateHistoryRecord(id, patch) {
+  const list = await readHistoryStore();
   const idx = list.findIndex((x) => String(x.id) === String(id));
   if (idx < 0) return null;
   const allowed = ['fav', 'featured', 'prompt'];
@@ -501,33 +413,26 @@ function updateHistoryRecord(id, patch) {
     if (k in patch) next[k] = patch[k];
   }
   list[idx] = next;
-  writeHistoryStore(list);
+  await writeHistoryStore(list);
   return enrichHistoryItem(next);
 }
 
-function deleteHistoryRecord(id) {
-  const list = readHistoryStore();
+async function deleteHistoryRecord(id) {
+  const list = await readHistoryStore();
   const idx = list.findIndex((x) => String(x.id) === String(id));
   if (idx < 0) return false;
   list.splice(idx, 1);
-  writeHistoryStore(list);
-  // 删除图片目录
-  const dir = path.join(FILES_DIR, String(id));
-  try {
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-  } catch (e) {
-    console.warn('delete files failed', e.message);
-  }
+  await writeHistoryStore(list);
+  await storage.deleteRecordFiles(id);
   return true;
 }
 
-function resolveModel(input) {
+async function resolveModel(input) {
   const key = String(input || DEFAULT_UI_MODEL).trim();
-  const MODEL_MAP = getModelMap();
+  const MODEL_MAP = await getModelMap();
   const meta = MODEL_MAP[key] || MODEL_MAP[DEFAULT_UI_MODEL];
   const uiKey = meta.uiKey || (UI_MODEL_KEYS.includes(key) ? key : DEFAULT_UI_MODEL);
   const id = meta.id;
-  // 始终返回独立副本；supportsImageSize 按实际上游模型 id 判定
   return {
     id,
     label: meta.label,
@@ -687,7 +592,7 @@ function proxyGenerate(modelId, payload) {
   });
 }
 
-function buildPayload(body, modelMeta) {
+async function buildPayload(body, modelMeta) {
   const prompt = String(body.prompt || '').trim();
   if (!prompt && !(body.images && body.images.length)) {
     const err = new Error('请输入提示词或上传参考图');
@@ -715,8 +620,8 @@ function buildPayload(body, modelMeta) {
         data.startsWith('api/files/') ||
         /^https?:\/\/[^/]+\/api\/files\//i.test(data)
       ) {
-        // 重新编辑场景：前端可能直接传本地文件 URL
-        const resolved = loadLocalFileAsBase64(data);
+        // 重新编辑场景：前端可能直接传 /api/files URL
+        const resolved = await loadLocalFileAsBase64(data);
         if (!resolved) {
           const err = new Error('参考图文件不存在或无法读取，请重新上传');
           err.status = 400;
@@ -899,7 +804,7 @@ async function handleGenerate(req, res) {
   }
   inflightGenerates.set(fp, Date.now());
 
-  const modelMeta = resolveModel(body.model || body.uiModel || DEFAULT_UI_MODEL);
+  const modelMeta = await resolveModel(body.model || body.uiModel || DEFAULT_UI_MODEL);
   const reqSize = normalizeImageSize(body.imageSize || body.res || '1K');
   console.log(
     `[generate] uiModel=${body.model || DEFAULT_UI_MODEL} → upstream=${modelMeta.id} ` +
@@ -909,7 +814,7 @@ async function handleGenerate(req, res) {
 
   let payload;
   try {
-    payload = buildPayload(body, modelMeta);
+    payload = await buildPayload(body, modelMeta);
   } catch (e) {
     inflightGenerates.delete(fp);
     return sendJson(res, e.status || 400, { ok: false, error: e.message });
@@ -926,10 +831,9 @@ async function handleGenerate(req, res) {
         upstream.raw?.slice(0, 300) ||
         `上游错误 HTTP ${upstream.status}`;
       console.error(`[generate] fail model=${modelMeta.id} status=${upstream.status} msg=${msg}`);
-      // 统一落盘并回传 record，避免前端再调 /api/history/fail 造成双份记录
       let fail = null;
       try {
-        fail = persistFailRecord({ body, error: String(msg) });
+        fail = await persistFailRecord({ body, error: String(msg) });
       } catch (_) { /* ignore */ }
       return sendJson(res, upstream.status === 401 || upstream.status === 403 ? upstream.status : 502, {
         ok: false,
@@ -945,10 +849,9 @@ async function handleGenerate(req, res) {
 
     const { images, texts } = extractImages(upstream.data);
     if (!images.length) {
-      // 可能被安全策略拦了，或只返回了文本
       const finish = upstream.data?.candidates?.[0]?.finishReason;
       const errMsg = texts.join('\n') || `未返回图片${finish ? '（finishReason: ' + finish + '）' : ''}`;
-      const fail = persistFailRecord({ body, error: errMsg });
+      const fail = await persistFailRecord({ body, error: errMsg });
       return sendJson(res, 502, {
         ok: false,
         error: errMsg,
@@ -962,8 +865,7 @@ async function handleGenerate(req, res) {
       });
     }
 
-    // 写入本地磁盘，刷新后可恢复
-    const record = persistGenerateResult({
+    const record = await persistGenerateResult({
       body,
       modelMeta,
       images,
@@ -974,7 +876,7 @@ async function handleGenerate(req, res) {
         usageMetadata: upstream.data?.usageMetadata,
       },
     });
-    console.log(`[persist] saved id=${record.id} files=${(record.imageFiles || []).join(',')}`);
+    console.log(`[persist] saved id=${record.id} mode=${storage.storageMode()} files=${(record.imageFiles || []).join(',')}`);
 
     return sendJson(res, 200, {
       ok: true,
@@ -992,17 +894,16 @@ async function handleGenerate(req, res) {
     const errMsg = '请求上游失败: ' + e.message;
     let fail = null;
     try {
-      fail = persistFailRecord({ body, error: errMsg });
+      fail = await persistFailRecord({ body, error: errMsg });
     } catch (_) { /* ignore */ }
-    // 必须带回 record，前端才能只插一条，不再二次 POST /api/history/fail
     return sendJson(res, 502, { ok: false, error: errMsg, record: fail });
   } finally {
     inflightGenerates.delete(fp);
   }
 }
 
-function handleHistoryList(req, res) {
-  const list = readHistoryStore().map(enrichHistoryItem);
+async function handleHistoryList(req, res) {
+  const list = (await readHistoryStore()).map(enrichHistoryItem);
   return sendJson(res, 200, { ok: true, items: list, total: list.length });
 }
 
@@ -1014,13 +915,13 @@ async function handleHistoryPatch(req, res, id) {
   } catch (e) {
     return sendJson(res, 400, { ok: false, error: '请求 JSON 无效' });
   }
-  const updated = updateHistoryRecord(id, body);
+  const updated = await updateHistoryRecord(id, body);
   if (!updated) return sendJson(res, 404, { ok: false, error: '记录不存在' });
   return sendJson(res, 200, { ok: true, record: updated });
 }
 
-function handleHistoryDelete(req, res, id) {
-  const ok = deleteHistoryRecord(id);
+async function handleHistoryDelete(req, res, id) {
+  const ok = await deleteHistoryRecord(id);
   if (!ok) return sendJson(res, 404, { ok: false, error: '记录不存在' });
   return sendJson(res, 200, { ok: true });
 }
@@ -1033,31 +934,17 @@ async function handleHistoryCreateFail(req, res) {
   } catch (e) {
     return sendJson(res, 400, { ok: false, error: '请求 JSON 无效' });
   }
-  const record = persistFailRecord({ body, error: body.error || '生成失败' });
+  const record = await persistFailRecord({ body, error: body.error || '生成失败' });
   return sendJson(res, 200, { ok: true, record });
 }
 
-function serveHistoryFile(req, res, id, fileName) {
-  // 防路径穿越
-  const safeId = String(id).replace(/[^a-zA-Z0-9_-]/g, '');
-  const safeName = path.basename(fileName);
-  const dir = path.resolve(FILES_DIR, safeId);
-  const fp = path.resolve(dir, safeName);
-  if (!fp.startsWith(dir + path.sep) && fp !== dir) {
-    res.writeHead(403);
-    return res.end('Forbidden');
-  }
-  if (!fs.existsSync(fp) || fs.statSync(fp).isDirectory()) {
-    res.writeHead(404);
-    return res.end('Not Found');
-  }
-  const ext = path.extname(fp).toLowerCase();
-  res.writeHead(200, {
+async function serveHistoryFile(req, res, id, fileName) {
+  const ext = path.extname(String(fileName || '')).toLowerCase();
+  return storage.pipeFileToResponse(res, id, fileName, {
     'Content-Type': MIME[ext] || 'application/octet-stream',
     'Cache-Control': 'public, max-age=31536000, immutable',
     'Access-Control-Allow-Origin': '*',
   });
-  fs.createReadStream(fp).pipe(res);
 }
 
 function serveStatic(req, res, urlPath) {
@@ -1083,6 +970,7 @@ function serveStatic(req, res, urlPath) {
 }
 
 const server = http.createServer(async (req, res) => {
+  try {
   const method = req.method || 'GET';
   const urlPath = req.url || '/';
 
@@ -1096,63 +984,69 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (method === 'GET' && (urlPath === '/api/health' || urlPath.startsWith('/api/health?'))) {
-    const cfg = readModelConfig();
-    ensureDataDirs();
+    const cfg = await readModelConfig();
+    await storage.ensureStorageReady();
     let historyCount = 0;
     try {
-      historyCount = readHistoryStore().length;
+      historyCount = (await readHistoryStore()).length;
     } catch (_) { /* ignore */ }
+    const info = storage.storageInfo();
+    const def = await resolveModel(DEFAULT_UI_MODEL);
     return sendJson(res, 200, {
       ok: true,
       baseUrl: BASE_URL,
-      defaultModel: resolveModel(DEFAULT_UI_MODEL).id,
+      defaultModel: def.id,
       models: Object.fromEntries(
         UI_MODEL_KEYS.map((k) => [k, { id: cfg[k].id, label: cfg[k].label }])
       ),
       hasKey: Boolean(API_KEY),
       keyHint: API_KEY ? `${API_KEY.slice(0, 6)}…${API_KEY.slice(-4)}` : null,
-      dataDir: DATA_DIR,
-      dataDirFromEnv: Boolean(String(process.env.DATA_DIR || '').trim()),
+      storage: info.mode,
+      dataDir: info.dataDir,
+      dataDirFromEnv: info.dataDirFromEnv,
+      r2: info.r2,
       historyCount,
-      // free 实例未挂盘时 dataDirFromEnv 多为 false，重启会丢数据
-      persistentHint: String(process.env.DATA_DIR || '').trim()
-        ? 'using DATA_DIR (expect persistent disk)'
-        : 'default ./data (ephemeral on most PaaS free tiers)',
+      persistentHint:
+        info.mode === 'r2'
+          ? 'using Cloudflare R2 (survives redeploy)'
+          : info.dataDirFromEnv
+            ? 'using DATA_DIR (expect persistent disk)'
+            : 'default ./data (ephemeral on free PaaS without R2)',
     });
   }
 
   // 模型配置：读取 / 保存（配置页）
   if (urlPath === '/api/model-config' || urlPath.startsWith('/api/model-config?')) {
-    if (method === 'GET') return handleGetModelConfig(req, res);
-    if (method === 'PUT' || method === 'POST') return handleSaveModelConfig(req, res);
+    if (method === 'GET') return await handleGetModelConfig(req, res);
+    if (method === 'PUT' || method === 'POST') return await handleSaveModelConfig(req, res);
   }
 
   if (method === 'POST' && (urlPath === '/api/generate' || urlPath.startsWith('/api/generate?'))) {
-    return handleGenerate(req, res);
+    return await handleGenerate(req, res);
   }
 
   // 历史列表
   if (method === 'GET' && (urlPath === '/api/history' || urlPath.startsWith('/api/history?'))) {
-    return handleHistoryList(req, res);
+    return await handleHistoryList(req, res);
   }
 
   // 保存失败记录（可选，生成失败时前端也可调）
   if (method === 'POST' && (urlPath === '/api/history/fail' || urlPath.startsWith('/api/history/fail?'))) {
-    return handleHistoryCreateFail(req, res);
+    return await handleHistoryCreateFail(req, res);
   }
 
   // PATCH /api/history/:id  DELETE /api/history/:id
   const histMatch = urlPath.match(/^\/api\/history\/([^/?#]+)/);
   if (histMatch) {
     const id = decodeURIComponent(histMatch[1]);
-    if (method === 'PATCH' || method === 'POST') return handleHistoryPatch(req, res, id);
-    if (method === 'DELETE') return handleHistoryDelete(req, res, id);
+    if (method === 'PATCH' || method === 'POST') return await handleHistoryPatch(req, res, id);
+    if (method === 'DELETE') return await handleHistoryDelete(req, res, id);
   }
 
   // GET /api/files/:id/:file
   const fileMatch = urlPath.match(/^\/api\/files\/([^/]+)\/([^/?#]+)/);
   if (method === 'GET' && fileMatch) {
-    return serveHistoryFile(req, res, decodeURIComponent(fileMatch[1]), decodeURIComponent(fileMatch[2]));
+    return await serveHistoryFile(req, res, decodeURIComponent(fileMatch[1]), decodeURIComponent(fileMatch[2]));
   }
 
   if (method === 'GET') {
@@ -1160,6 +1054,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   sendJson(res, 404, { ok: false, error: 'Not Found' });
+  } catch (e) {
+    console.error('[http]', e);
+    if (!res.headersSent) {
+      sendJson(res, 500, { ok: false, error: e.message || '服务器错误' });
+    }
+  }
 });
 
 server.on('error', (err) => {
@@ -1181,19 +1081,30 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  备选:     http://localhost:${PORT}/`);
   console.log(`  健康检查: http://127.0.0.1:${PORT}/api/health`);
   console.log(`  网关:     ${BASE_URL}`);
-  const bootCfg = readModelConfig();
-  console.log(`  默认:     Nano Banana Pro → ${bootCfg.pro.id}`);
-  console.log(`  映射:     nano → ${bootCfg.nano.id}`);
-  console.log(`           nano2 → ${bootCfg.nano2.id}`);
-  console.log(`           pro → ${bootCfg.pro.id}`);
-  console.log(`  API Key:  ${API_KEY ? '已配置' : '未配置（请创建 .env 填入 JWMP_API_KEY）'}`);
-  ensureDataDirs();
-  const n = readHistoryStore().length;
-  console.log(`  数据目录: ${DATA_DIR}${process.env.DATA_DIR ? ' (DATA_DIR)' : ' (默认 ./data，部署重启可能丢失)'}`);
-  console.log(`  本地记录: ${n} 条 → ${HISTORY_FILE}`);
-  console.log(`  模型配置: ${MODEL_CONFIG_FILE}`);
-  console.log('  ----------------------------------------');
-  console.log('  关闭本窗口 = 停止服务，页面将无法访问');
-  console.log('  ========================================');
-  console.log('');
+  (async () => {
+    try {
+      const bootCfg = await readModelConfig();
+      console.log(`  默认:     Nano Banana Pro → ${bootCfg.pro.id}`);
+      console.log(`  映射:     nano → ${bootCfg.nano.id}`);
+      console.log(`           nano2 → ${bootCfg.nano2.id}`);
+      console.log(`           pro → ${bootCfg.pro.id}`);
+      console.log(`  API Key:  ${API_KEY ? '已配置' : '未配置（请创建 .env 填入 JWMP_API_KEY）'}`);
+      await storage.ensureStorageReady();
+      const n = (await readHistoryStore()).length;
+      const info = storage.storageInfo();
+      console.log(`  存储:     ${info.mode === 'r2' ? 'Cloudflare R2 ✓' : '本地磁盘'}`);
+      if (info.mode === 'r2') {
+        console.log(`  R2 桶:    ${info.r2.bucket}`);
+      } else {
+        console.log(`  数据目录: ${info.dataDir}${info.dataDirFromEnv ? ' (DATA_DIR)' : ' (默认，云上可能丢失)'}`);
+      }
+      console.log(`  历史记录: ${n} 条`);
+    } catch (e) {
+      console.error('  启动时读取存储失败:', e.message);
+    }
+    console.log('  ----------------------------------------');
+    console.log('  关闭本窗口 = 停止服务，页面将无法访问');
+    console.log('  ========================================');
+    console.log('');
+  })();
 });
