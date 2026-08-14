@@ -957,6 +957,11 @@
       flex-shrink: 0;
     }
 
+    .history,
+    .history-list,
+    .hist-card {
+      -webkit-touch-callout: none;
+    }
     .history-list {
       flex: 1;
       overflow-y: auto;
@@ -973,8 +978,16 @@
       cursor: pointer;
       transition: all .15s;
       background: #f8fafc;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .hist-card img {
+      -webkit-user-drag: none;
+      -webkit-touch-callout: none;
+      pointer-events: none;
     }
     .hist-card:hover { border-color: #e2e8f0; background: #f1f5f9; }
+    .hist-card.ctx-open { border-color: #e2e8f0; background: #f1f5f9; }
     .hist-card.active {
       border-color: var(--blue);
       background: #fff;
@@ -1039,6 +1052,45 @@
       padding: 7px 6px 2px;
       font-size: 11px;
       color: var(--text-3);
+    }
+
+    .hist-ctx-menu {
+      position: fixed;
+      z-index: 240;
+      min-width: 148px;
+      padding: 6px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: var(--shadow-lg);
+      display: none;
+    }
+    .hist-ctx-menu.show { display: block; animation: pop .12s ease; }
+    .hist-ctx-item {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: var(--text);
+      text-align: left;
+      transition: background .12s;
+    }
+    .hist-ctx-item svg {
+      width: 15px;
+      height: 15px;
+      flex-shrink: 0;
+      color: var(--text-2);
+    }
+    .hist-ctx-item:hover:not(:disabled) { background: #f8fafc; }
+    .hist-ctx-item.danger { color: var(--danger); }
+    .hist-ctx-item.danger svg { color: var(--danger); }
+    .hist-ctx-item.danger:hover:not(:disabled) { background: var(--danger-bg); }
+    .hist-ctx-item:disabled {
+      opacity: .38;
+      cursor: default;
     }
 
     /* ========== 资产页 ========== */
@@ -3074,7 +3126,7 @@
           </div>
         </section>
 
-        <aside class="history" id="historyPanel">
+        <aside class="history" id="historyPanel" oncontextmenu="event.preventDefault()">
           <div class="history-header">历史记录</div>
           <div class="history-list" id="historyList"></div>
         </aside>
@@ -3129,6 +3181,16 @@
   </div>
 
   <div class="toast" id="toast"></div>
+  <div class="hist-ctx-menu" id="histCtxMenu" role="menu">
+    <button type="button" class="hist-ctx-item" data-ctx="download" role="menuitem">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M7 11l5 5 5-5"/><path d="M5 20h14"/></svg>
+      下载
+    </button>
+    <button type="button" class="hist-ctx-item danger" data-ctx="delete" role="menuitem">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M7 7l1 13h8l1-13"/></svg>
+      删除
+    </button>
+  </div>
 
   <!-- 参考图放大预览 -->
   <div class="ref-lightbox" id="refLightbox" aria-hidden="true">
@@ -3560,6 +3622,7 @@
       $('#ratioPanel').classList.remove('show');
       $('#modelBtn').classList.remove('active');
       $('#ratioBtn').classList.remove('active');
+      hideHistContextMenu();
     }
 
     function artHTML(itemOrArt, size = 'full') {
@@ -4060,6 +4123,131 @@
       showToast('已开始下载');
     }
 
+    function hideHistContextMenu() {
+      const menu = $('#histCtxMenu');
+      if (!menu) return;
+      menu.classList.remove('show');
+      menu.dataset.id = '';
+      $$('.hist-card.ctx-open').forEach(el => el.classList.remove('ctx-open'));
+    }
+
+    function findHistCardFromEvent(e) {
+      const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+      for (const node of path) {
+        if (node && node.classList && node.classList.contains('hist-card')) return node;
+      }
+      let el = e.target;
+      if (el && el.nodeType === 3) el = el.parentElement;
+      if (el && typeof el.closest === 'function') {
+        const card = el.closest('.hist-card');
+        if (card) return card;
+      }
+      while (el && el !== document) {
+        if (el.classList && el.classList.contains('hist-card')) return el;
+        el = el.parentElement || el.parentNode;
+      }
+      return null;
+    }
+
+    function findHistoryItemById(id) {
+      const key = String(id ?? '');
+      if (!key) return null;
+      return HISTORY.find(h => String(h.id) === key) || null;
+    }
+
+    function showHistContextMenu(e, item, card) {
+      const menu = $('#histCtxMenu');
+      if (!menu || !item) return;
+      $('#modelDropdown')?.classList.remove('show');
+      $('#ratioPanel')?.classList.remove('show');
+      $('#modelBtn')?.classList.remove('active');
+      $('#ratioBtn')?.classList.remove('active');
+
+      $$('.hist-card.ctx-open').forEach(el => el.classList.remove('ctx-open'));
+      card?.classList.add('ctx-open');
+
+      const canDownload = getItemImageUrls(item).length > 0 || !!item.imageUrl;
+      const dlBtn = menu.querySelector('[data-ctx="download"]');
+      if (dlBtn) {
+        dlBtn.disabled = !canDownload;
+        dlBtn.title = canDownload ? '下载图片' : '没有可下载的图片';
+      }
+
+      menu.classList.add('show');
+      menu.dataset.id = String(item.id);
+      showHistContextMenu._openedAt = Date.now();
+      menu.style.left = '0px';
+      menu.style.top = '0px';
+
+      const pad = 8;
+      const x = e.clientX;
+      const y = e.clientY;
+      const r = menu.getBoundingClientRect();
+      let left = x;
+      let top = y;
+      if (left + r.width > window.innerWidth - pad) left = Math.max(pad, window.innerWidth - r.width - pad);
+      if (top + r.height > window.innerHeight - pad) top = Math.max(pad, window.innerHeight - r.height - pad);
+      if (left < pad) left = pad;
+      if (top < pad) top = pad;
+      menu.style.left = left + 'px';
+      menu.style.top = top + 'px';
+    }
+
+    function handleHistoryContextMenu(e) {
+      const inMenu = !!(e.target && e.target.closest && e.target.closest('#histCtxMenu'));
+      if (inMenu) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      const card = findHistCardFromEvent(e);
+      const inHistory = !!(card || (e.target && e.target.closest && (
+        e.target.closest('#historyList') || e.target.closest('#historyPanel')
+      )));
+      if (!inHistory) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+      if (!card) {
+        hideHistContextMenu();
+        return;
+      }
+      const item = findHistoryItemById(card.dataset.id);
+      if (item) showHistContextMenu(e, item, card);
+      else hideHistContextMenu();
+    }
+
+    async function deleteHistoryItem(item) {
+      if (!item) return false;
+      const id = item.id;
+      if (item.persisted || id > 1000) {
+        try {
+          const r = await fetch(apiUrl('/api/history/' + id), { method: 'DELETE' });
+          if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            showToast(data.error || '删除失败');
+            return false;
+          }
+        } catch (_) {
+          showToast('删除失败，请检查网络');
+          return false;
+        }
+      }
+      const idx = HISTORY.findIndex(h => h.id === id);
+      if (idx >= 0) HISTORY.splice(idx, 1);
+      if (state.detailId === id) closeDetail();
+      if (state.currentId === id) {
+        const first = HISTORY.find(h => h.inHistory !== false);
+        state.currentId = first ? first.id : null;
+        HISTORY.forEach(h => h.active = h.id === state.currentId);
+      }
+      state.selectedAssets.delete(id);
+      renderHistory();
+      renderFeed({ keepScroll: true });
+      if (state.page === 'assets') renderAssets();
+      return true;
+    }
+
     function useAsReference(item) {
       if (!item) return;
       const urls = getItemImageUrls(item);
@@ -4080,6 +4268,7 @@
     }
 
     function renderHistory() {
+      hideHistContextMenu();
       // 与主时间线共用顶栏日期筛选
       const list = HISTORY.filter(h => h.inHistory !== false && matchFeedDate(h));
       const hist = $('#historyList');
@@ -4091,7 +4280,7 @@
       hist.innerHTML = list.map(item => {
         if (item.type === 'fail') {
           return `
-            <div class="hist-card ${item.active ? 'active' : ''}" data-id="${item.id}">
+            <div class="hist-card ${item.active ? 'active' : ''}" data-id="${item.id}" oncontextmenu="event.preventDefault()">
               <div class="hist-fail">
                 <div class="fail-title">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
@@ -4104,7 +4293,7 @@
         }
         const hasReal = !!(item.imageUrl || (item.images && item.images.length));
         return `
-          <div class="hist-card ${item.active ? 'active' : ''}" data-id="${item.id}">
+          <div class="hist-card ${item.active ? 'active' : ''}" data-id="${item.id}" oncontextmenu="event.preventDefault()">
             <div class="hist-thumb ${hasReal ? 'bg-real' : (item.bg || 'bg-mint')}">${artHTML(item, 'mini')}</div>
             <div class="hist-meta"><span>${item.time}</span><span>${item.user}</span></div>
           </div>`;
@@ -5299,6 +5488,48 @@
         syncHistoryPanelUI();
       }
     });
+
+    window.addEventListener('contextmenu', handleHistoryContextMenu, true);
+    document.addEventListener('contextmenu', handleHistoryContextMenu, true);
+
+    $('#historyList').addEventListener('scroll', hideHistContextMenu, { passive: true });
+
+    $('#histCtxMenu')?.addEventListener('click', async e => {
+      const btn = e.target.closest('[data-ctx]');
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const item = findHistoryItemById($('#histCtxMenu').dataset.id);
+      hideHistContextMenu();
+      if (!item) return;
+      if (btn.dataset.ctx === 'download') {
+        downloadItem(item, 0);
+        return;
+      }
+      if (btn.dataset.ctx === 'delete') {
+        const ok = await deleteHistoryItem(item);
+        if (ok) showToast('已删除');
+      }
+    });
+
+    $('#histCtxMenu')?.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    document.addEventListener('pointerdown', e => {
+      if (Date.now() - (showHistContextMenu._openedAt || 0) < 320) return;
+      if (e.target.closest('#histCtxMenu') || e.target.closest('.hist-card')) return;
+      hideHistContextMenu();
+    }, true);
+    document.addEventListener('click', e => {
+      if (Date.now() - (showHistContextMenu._openedAt || 0) < 320) return;
+      if (!e.target.closest('#histCtxMenu')) hideHistContextMenu();
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') hideHistContextMenu();
+    });
+    window.addEventListener('resize', hideHistContextMenu);
 
     // 资产页：Tab
     $('#assetsTabs').addEventListener('click', e => {
