@@ -948,13 +948,24 @@
 
     .history-header {
       height: 48px;
-      padding: 0 16px;
+      padding: 0 12px 0 16px;
       display: flex;
       align-items: center;
+      justify-content: space-between;
+      gap: 8px;
       font-size: 13.5px;
       font-weight: 600;
       color: #334155;
       flex-shrink: 0;
+    }
+    .history-header-title {
+      flex-shrink: 0;
+    }
+    .history-success-toggle {
+      font-size: 12px;
+      font-weight: 500;
+      color: #64748b;
+      gap: 6px;
     }
 
     .history,
@@ -3127,7 +3138,13 @@
         </section>
 
         <aside class="history" id="historyPanel" oncontextmenu="event.preventDefault()">
-          <div class="history-header">历史记录</div>
+          <div class="history-header">
+            <span class="history-header-title">历史记录</span>
+            <label class="toggle-wrap history-success-toggle" id="histSuccessOnlyToggle" title="仅显示成功记录">
+              <span class="toggle on" id="histSuccessToggle"></span>
+              仅显示成功
+            </label>
+          </div>
           <div class="history-list" id="historyList"></div>
         </aside>
       </div>
@@ -3584,6 +3601,8 @@
       generating: false,
       assetsTab: 'all',
       successOnly: true,
+      /** 历史侧栏：默认只显示成功记录 */
+      historySuccessOnly: true,
       batchMode: false,
       selectedAssets: new Set(),
       creatorFilter: 'all',
@@ -4270,11 +4289,20 @@
     function renderHistory() {
       hideHistContextMenu();
       // 与主时间线共用顶栏日期筛选
-      const list = HISTORY.filter(h => h.inHistory !== false && matchFeedDate(h));
+      const visible = HISTORY.filter(h => h.inHistory !== false && matchFeedDate(h));
+      const list = state.historySuccessOnly
+        ? visible.filter(h => h.type !== 'fail')
+        : visible;
       const hist = $('#historyList');
       if (!hist) return;
       if (!list.length) {
-        hist.innerHTML = `<div class="hist-empty" style="padding:20px 14px;color:#94a3b8;font-size:12.5px;text-align:center;line-height:1.5;">${state.feedDateFilterEnabled ? '该日期范围内暂无记录' : '暂无历史记录'}</div>`;
+        let emptyMsg = '暂无历史记录';
+        if (visible.length && state.historySuccessOnly) {
+          emptyMsg = state.feedDateFilterEnabled ? '该日期范围内暂无成功记录' : '暂无成功记录';
+        } else if (state.feedDateFilterEnabled) {
+          emptyMsg = '该日期范围内暂无记录';
+        }
+        hist.innerHTML = `<div class="hist-empty" style="padding:20px 14px;color:#94a3b8;font-size:12.5px;text-align:center;line-height:1.5;">${emptyMsg}</div>`;
         return;
       }
       hist.innerHTML = list.map(item => {
@@ -5546,6 +5574,14 @@
       state.successOnly = !state.successOnly;
       $('#successToggle').classList.toggle('on', state.successOnly);
       renderAssets();
+    });
+
+    // 历史侧栏：仅显示成功
+    $('#histSuccessOnlyToggle')?.addEventListener('click', e => {
+      e.preventDefault();
+      state.historySuccessOnly = !state.historySuccessOnly;
+      $('#histSuccessToggle')?.classList.toggle('on', state.historySuccessOnly);
+      renderHistory();
     });
 
     // 批量操作
